@@ -92,25 +92,122 @@ class YoloVideoRunner:
 
 
 def run_yolo_on_video(
-    video_path: str | Path,
+    input_path: str | Path,
     *,
+    output_path: Optional[str | Path] = None,
     model_source: str = "yolov8n.pt",
     device: Optional[str] = None,
     yolo_kwargs: Optional[dict[str, Any]] = None,
     save_annotated: bool = False,
-    annotated_suffix: str = "_annotated",
-    annotated_path: Optional[str | Path] = None,
     annotated_fourcc: str = "mp4v",
 ) -> Iterator[Any]:
-    """Yield raw YOLO detections and optionally dump the annotated clip beside the source video."""
+    """Yield raw YOLO detections and optionally save annotated video to output_path.
+    
+    Args:
+        input_path: Path to input video file
+        output_path: Path where annotated video will be saved (required if save_annotated=True)
+        model_source: YOLO model weights to load
+        device: Device to run inference on
+        yolo_kwargs: Additional kwargs for YOLO inference
+        save_annotated: Whether to save annotated frames to video
+        annotated_fourcc: Video codec fourcc code
+    """
+    if save_annotated and output_path is None:
+        raise ValueError("output_path is required when save_annotated=True")
 
     runner = YoloVideoRunner(
         model_source=model_source,
         device=device,
         yolo_kwargs=yolo_kwargs,
         save_annotated=save_annotated,
-        annotated_suffix=annotated_suffix,
-        annotated_path=annotated_path,
+        annotated_suffix="",  # No longer needed with explicit output_path
+        annotated_path=output_path,
         annotated_fourcc=annotated_fourcc,
     )
-    yield from runner.run(video_path)
+    yield from runner.run(input_path)
+
+
+def run_yolo_tracking_mode(
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    model_source: str = "yolov8n.pt",
+    device: Optional[str] = None,
+    track_kwargs: Optional[dict[str, Any]] = None,
+    fourcc: str = "mp4v",
+) -> None:
+    """Execute YOLO tracking using Ultralytics' built-in tracker and save annotated video.
+    
+    This function uses model.track() internally, which maintains object IDs across frames.
+    It writes a video with bounding boxes and tracking IDs overlaid on each frame.
+    
+    Args:
+        input_path: Path to input video file
+        output_path: Path where annotated video will be saved
+        model_source: YOLO model weights to load
+        device: Device to run inference on (e.g., 'cuda:0', 'cpu')
+        track_kwargs: Additional kwargs for model.track() (merged with default person-only filter)
+        fourcc: Video codec fourcc code
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    
+    # Initialize model
+    model = YOLO(model_source)
+    if device:
+        model.to(device)
+    
+    # Merge default person-only filtering with user kwargs
+    merged_kwargs = {"classes": [0], "stream": True, "verbose": False, **(track_kwargs or {})}
+    
+    # Run tracking
+    results_generator = model.track(source=str(input_path), **merged_kwargs)
+    
+    writer: Optional[cv2.VideoWriter] = None
+    
+    try:
+        for result in results_generator:
+            # Extract frame and tracking data
+            frame = result.orig_img.copy()
+            boxes = result.boxes
+            
+            # Initialize writer on first frame
+            if writer is None:
+                height, width = frame.shape[:2]
+                fps = 30.0  # Ultralytics doesn't expose original FPS, default to 30
+                fourcc_code = cv2.VideoWriter_fourcc(*fourcc)  # type: ignore[attr-defined]
+                writer = cv2.VideoWriter(str(output_path), fourcc_code, fps, (width, height))
+                if not writer.isOpened():
+                    raise RuntimeError(f"Unable to create output video at: {output_path}")
+            
+            # Draw bounding boxes and track IDs
+            if boxes is not None and boxes.id is not None:
+                xywh = boxes.xywh.cpu().numpy() if hasattr(boxes.xywh, "cpu") else boxes.xywh  # type: ignore[union-attr]
+                ids = boxes.id.cpu().numpy() if hasattr(boxes.id, "cpu") else boxes.id  # type: ignore[union-attr]
+                for box, track_id in zip(xywh, ids):
+                    x_center, y_center, w, h = box
+                    x1 = int(x_center - w / 2)
+                    y1 = int(y_center - h / 2)
+                    x2 = int(x_center + w / 2)
+                    y2 = int(y_center + h / 2)
+                    
+                    # Draw bounding box
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    
+                    # Draw track ID
+                    label = f"ID: {int(track_id)}"
+                    cv2.putText(
+                        frame,
+                        label,
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 0),
+                        2,
+                    )
+            
+            writer.write(frame)
+    
+    finally:
+        if writer is not None:
+            writer.release()
