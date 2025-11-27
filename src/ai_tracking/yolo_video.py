@@ -13,6 +13,132 @@ from ultralytics import YOLO
 from ultralytics.engine.results import Results
 
 
+def compute_hsv_histogram(
+    crop: np.ndarray,
+    *,
+    h_bins: int = 8,
+    s_bins: int = 4,
+    v_bins: int = 4,
+    shirt_region_ratio: float = 0.5,
+) -> list[float]:
+    """Calculate normalized HSV histogram from the upper portion (shirt region) of a person crop.
+    
+    Args:
+        crop: BGR image as numpy array (from OpenCV)
+        h_bins: Number of bins for Hue channel (0-180 in OpenCV)
+        s_bins: Number of bins for Saturation channel (0-255)
+        v_bins: Number of bins for Value channel (0-255)
+        shirt_region_ratio: Proportion of upper crop to analyze (0.5 = top 50%)
+        
+    Returns:
+        Normalized histogram as 1D list of floats (length = h_bins * s_bins * v_bins)
+    """
+    if crop.size == 0:
+        # Return zero vector for empty crops
+        return [0.0] * (h_bins * s_bins * v_bins)
+    
+    # Extract upper region (shirt area)
+    height = crop.shape[0]
+    shirt_height = int(height * shirt_region_ratio)
+    if shirt_height == 0:
+        shirt_height = 1
+    shirt_region = crop[:shirt_height, :]
+    
+    # Convert to HSV
+    hsv = cv2.cvtColor(shirt_region, cv2.COLOR_BGR2HSV)
+    
+    # Calculate 3D histogram
+    hist = cv2.calcHist(
+        [hsv],
+        [0, 1, 2],  # H, S, V channels
+        None,
+        [h_bins, s_bins, v_bins],
+        [0, 180, 0, 256, 0, 256]  # H range: 0-180, S/V range: 0-256
+    )
+    
+    # Normalize histogram
+    cv2.normalize(hist, hist)
+    
+    # Flatten to 1D list
+    return hist.flatten().tolist()
+
+
+def _save_histogram_visualization(
+    hsv_hist: list[float],
+    output_path: Path,
+    *,
+    h_bins: int = 8,
+    s_bins: int = 4,
+    v_bins: int = 4,
+) -> None:
+    """Save a visual representation of the HSV histogram as a bar chart with color coding.
+    
+    Args:
+        hsv_hist: Flattened HSV histogram vector
+        output_path: Path where the visualization image will be saved
+        h_bins: Number of hue bins used in histogram
+        s_bins: Number of saturation bins used in histogram
+        v_bins: Number of value bins used in histogram
+    """
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import hsv_to_rgb
+    
+    # Generate color for each bin based on its H, S, V coordinates
+    colors = []
+    for i in range(len(hsv_hist)):
+        # Decode bin index back to h, s, v coordinates
+        h_idx = i // (s_bins * v_bins)
+        remaining = i % (s_bins * v_bins)
+        s_idx = remaining // v_bins
+        v_idx = remaining % v_bins
+        
+        # Convert to normalized HSV values (0-1 range for matplotlib)
+        # H: 0-180 in OpenCV, map to 0-1
+        # S: 0-255 in OpenCV, map to 0-1
+        # V: 0-255 in OpenCV, map to 0-1
+        h_normalized = (h_idx + 0.5) / h_bins  # Center of bin
+        s_normalized = (s_idx + 0.5) / s_bins
+        v_normalized = (v_idx + 0.5) / v_bins
+        
+        # Convert HSV to RGB for matplotlib
+        rgb = hsv_to_rgb([h_normalized, s_normalized, v_normalized])
+        colors.append(rgb)
+    
+    # Create figure with two subplots: histogram + color bar
+    fig, (ax_hist, ax_color) = plt.subplots(2, 1, figsize=(12, 5), 
+                                             gridspec_kw={'height_ratios': [4, 0.3], 'hspace': 0.15})
+    
+    # Plot histogram bars with corresponding colors
+    x = np.arange(len(hsv_hist))
+    ax_hist.bar(x, hsv_hist, width=1.0, color=colors, edgecolor='black', linewidth=0.3)
+    
+    # Styling for histogram
+    ax_hist.set_ylabel('Normalized Frequency', fontsize=10)
+    ax_hist.set_title(f'HSV Histogram ({h_bins}H × {s_bins}S × {v_bins}V = {len(hsv_hist)} bins)', fontsize=11)
+    ax_hist.grid(axis='y', alpha=0.3)
+    ax_hist.set_xlim(-0.5, len(hsv_hist) - 0.5)
+    
+    # Create color reference bar at bottom
+    color_array = np.array(colors).reshape(1, -1, 3)
+    ax_color.imshow(color_array, aspect='auto', extent=[0, len(hsv_hist), 0, 1])
+    ax_color.set_yticks([])
+    ax_color.set_xlabel('Histogram Bin Index (color = H-S-V value)', fontsize=10)
+    ax_color.set_xlim(0, len(hsv_hist))
+    
+    # Add vertical lines to separate Hue blocks
+    for h in range(1, h_bins):
+        bin_boundary = h * s_bins * v_bins
+        ax_hist.axvline(bin_boundary - 0.5, color='white', linewidth=2, linestyle='--', alpha=0.7)
+        ax_color.axvline(bin_boundary, color='white', linewidth=2, linestyle='--', alpha=0.7)
+    
+    # Save figure
+    plt.tight_layout()
+    plt.savefig(str(output_path), dpi=100, bbox_inches='tight')
+    plt.close(fig)
+
+
 class YoloVideoRunner:
     """Execute YOLO on each frame of a video, optionally persisting annotated frames and crops."""
 
@@ -28,6 +154,7 @@ class YoloVideoRunner:
         annotated_fourcc: str = "mp4v",
         save_crops: bool = False,
         output_dir: Optional[str | Path] = None,
+        visualize_histograms: Optional[bool] = None,
     ) -> None:
         self.model_source = model_source
         self.device = device
@@ -38,6 +165,7 @@ class YoloVideoRunner:
         self.annotated_fourcc = annotated_fourcc
         self.save_crops = save_crops
         self.output_dir = Path(output_dir) if output_dir else None
+        self._visualize_histograms = visualize_histograms
         self._model: Optional[YOLO] = None
 
     @property
@@ -54,12 +182,17 @@ class YoloVideoRunner:
         video_path: str | Path,
         frames: Optional[int | list[int]] = None,
     ) -> Iterator[Any]:
-        return self._inference_generator(Path(video_path), frames)
+        # Auto-enable histogram visualization in debug mode (when frames is specified)
+        visualize = self._visualize_histograms
+        if visualize is None:
+            visualize = frames is not None
+        return self._inference_generator(Path(video_path), frames, visualize)
 
     def _inference_generator(
         self,
         video_path: Path,
         frames: Optional[int | list[int]] = None,
+        visualize_histograms: bool = False,
     ) -> Generator[Any, None, None]:
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -119,7 +252,18 @@ class YoloVideoRunner:
                             crop_path = frame_dir / crop_filename
                             cv2.imwrite(str(crop_path), crop)
 
+                            # Compute HSV histogram for the crop
+                            hsv_hist = compute_hsv_histogram(crop)
+                            meta["hsv_hist"] = hsv_hist
                             meta["filename"] = crop_filename
+                            
+                            # Optionally save histogram visualization
+                            if visualize_histograms:
+                                _save_histogram_visualization(
+                                    hsv_hist,
+                                    frame_dir / f"crop_{crop_idx:04d}_hist.png"
+                                )
+                            
                             frame_crops.append(meta)
                         
                         # Store frame metadata with its crops
@@ -232,6 +376,7 @@ def run_yolo_on_video(
     save_annotated: bool = False,
     annotated_fourcc: str = "mp4v",
     save_crops: bool = False,
+    visualize_histograms: Optional[bool] = None,
 ) -> Iterator[Any]:
     """Yield raw YOLO detections and optionally save annotated video and/or person crops.
     
@@ -245,6 +390,7 @@ def run_yolo_on_video(
         save_annotated: Whether to save annotated frames to video
         annotated_fourcc: Video codec fourcc code
         save_crops: Whether to save person crops and full frames to disk
+        visualize_histograms: Whether to save histogram visualizations. If None, auto-enabled when frames is not None (debug mode).
     """
     output_dir_path = Path(output_dir) if output_dir else None
     
@@ -268,6 +414,7 @@ def run_yolo_on_video(
         annotated_fourcc=annotated_fourcc,
         save_crops=save_crops,
         output_dir=output_dir_path,
+        visualize_histograms=visualize_histograms,
     )
     yield from runner.run(input_path, frames=frames)
 

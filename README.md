@@ -48,3 +48,68 @@ for result in run_yolo_on_video(
 ):
     pass
 ```
+
+### Extracting person crops with HSV histograms
+
+Enable crop extraction to save person bounding boxes as individual images with metadata including HSV color histograms:
+
+```python
+from ai_tracking import run_yolo_on_video
+
+for result in run_yolo_on_video(
+    "/path/to/video.mp4",
+    output_dir="./data/output/my_run",
+    save_crops=True,
+    frames=[24, 48, 72]  # Optional: process specific frames only
+):
+    pass
+```
+
+This creates the following structure:
+
+```
+data/output/my_run/
+ crops_metadata.json          # Complete metadata for all crops
+ annotated-video.mp4           # Optional annotated video
+ frame_0024/
+    frame_0024.jpg            # Full frame image
+    crop_0001.jpg             # Person crop 1
+    crop_0001_hist.png        # HSV histogram visualization (debug mode only)
+    crop_0002.jpg
+    crop_0002_hist.png
+    ...
+ frame_0048/
+ frame_0072/
+```
+
+The `crops_metadata.json` includes:
+
+```json
+{
+  "frames": {
+    "frame_0024": {
+      "frame_idx": 24,
+      "crops": [
+        {
+          "bbox": [x1, y1, x2, y2],
+          "class_name": "person",
+          "confidence": 0.90,
+          "filename": "crop_0001.jpg",
+          "hsv_hist": [0.0, 0.0, ..., 0.05]  // 128-dim normalized feature vector
+        }
+      ]
+    }
+  }
+}
+```
+
+**HSV Histogram Features:**
+- Computed from the **upper 50% of each crop** (shirt region)
+- Default bins: **8 Hue  4 Saturation  4 Value = 128 dimensions**
+- Normalized for comparability across different crop sizes
+- Ideal for clustering similar players/objects
+
+**Histogram Visualizations:**
+- Automatically enabled in **debug mode** (when `frames` parameter is specified)
+- Automatically disabled in **production mode** (when `frames=None`)
+- Override with `visualize_histograms=True/False` parameter
