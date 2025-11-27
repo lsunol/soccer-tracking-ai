@@ -29,7 +29,7 @@ def main():
         input_path=input_video,
         output_dir=str(output_dir),
         save_annotated=True,
-        save_crops=False,
+        save_crops=True,
         frames=[24, 48, 72],
         device=device,
         run_clustering=True,

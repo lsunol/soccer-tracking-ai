@@ -331,10 +331,7 @@ class YoloVideoRunner:
                 if self.save_crops or self.run_clustering:
                     with open(json_path, "w", encoding="utf-8") as f:
                         json.dump(metadata_summary, f, indent=2)
-                    if self.run_clustering:
-                        print(f"Metadata updated with cluster assignments: {json_path}")
-                    else:
-                        print(f"Metadata saved to: {json_path}")
+                    print(f"Metadata saved to: {json_path}")
 
     def _build_writer(self, video_path: Path, cap: cv2.VideoCapture) -> cv2.VideoWriter:
         output_path = self.annotated_path or video_path.with_name(

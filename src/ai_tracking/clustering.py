@@ -40,25 +40,19 @@ def run_hsv_clustering(
         debug_plots: Whether to generate PCA/UMAP visualizations
         
     Returns:
-        Updated metadata dict with cluster_id field added to each crop
+        Updated metadata dict with cluster_id field added to each crop and clustering info
     """
     output_path = Path(output_dir) if output_dir else None
-    
-    # Create clustering subdirectory for outputs
-    if output_path:
-        clustering_dir = output_path / "clustering"
-        clustering_dir.mkdir(exist_ok=True)
-    else:
-        clustering_dir = None
-    
-    clustering_report = {
-        "k_range": [k_min, k_max],
-        "frames": {}
-    }
     
     # Process each frame independently
     for frame_key, frame_data in metadata["frames"].items():
         print(f"Clustering {frame_key} ({frame_data['num_crops']} crops)...")
+        
+        # Determine frame directory for outputs
+        frame_dir = None
+        if output_path:
+            frame_dir = output_path / frame_key
+            frame_dir.mkdir(parents=True, exist_ok=True)
         
         # Extract feature matrix
         feature_matrix, crop_indices = _extract_feature_matrix(frame_data)
@@ -68,6 +62,12 @@ def run_hsv_clustering(
             # Assign all to cluster 0
             for i in crop_indices:
                 frame_data["crops"][i]["cluster_id"] = 0
+            # Add minimal clustering info
+            frame_data["clustering"] = {
+                "optimal_k": 1,
+                "inertias_per_k": {},
+                "cluster_distribution": {"0": len(feature_matrix)}
+            }
             continue
         
         # Normalize features
@@ -97,47 +97,40 @@ def run_hsv_clustering(
         for i, crop_idx in enumerate(crop_indices):
             frame_data["crops"][crop_idx]["cluster_id"] = int(cluster_labels[i])
         
-        # Save frame clustering report
-        frame_report = {
-            "num_crops": len(feature_matrix),
-            "k_tested": list(k_range),
-            "inertias": inertias,
+        # Build inertias_per_k dict
+        inertias_per_k = {str(k): inertia for k, inertia in zip(k_range, inertias)}
+        
+        # Add clustering metadata to frame
+        frame_data["clustering"] = {
             "optimal_k": optimal_k,
-            "cluster_sizes": {
-                int(label): int(count) 
+            "inertias_per_k": inertias_per_k,
+            "cluster_distribution": {
+                str(label): int(count) 
                 for label, count in zip(*np.unique(cluster_labels, return_counts=True))
             }
         }
-        clustering_report["frames"][frame_key] = frame_report
         
-        # Generate visualizations if requested
-        if debug_plots and clustering_dir:
+        # Generate visualizations if requested (save in frame directory)
+        if debug_plots and frame_dir:
             _visualize_clusters(
                 feature_matrix_scaled,
                 cluster_labels,
-                frame_key,
                 optimal_k,
-                clustering_dir
+                frame_dir
             )
             _visualize_elbow(
                 list(k_range),
                 inertias,
                 optimal_k,
-                frame_key,
-                clustering_dir
+                frame_dir
             )
         
-        # Save centroids
-        if clustering_dir:
-            centroids_path = clustering_dir / f"{frame_key}_centroids.npy"
+        # Save centroids in frame directory
+        if frame_dir:
+            centroids_path = frame_dir / "cluster_centroids.npy"
             np.save(str(centroids_path), optimal_model.cluster_centers_)
     
-    # Save clustering report
-    if clustering_dir:
-        report_path = clustering_dir / "clustering_report.json"
-        with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(clustering_report, f, indent=2)
-        print(f"\nClustering report saved to {report_path}")
+    print(f"\nClustering complete. Results added to metadata.")
     
     return metadata
 
@@ -212,7 +205,6 @@ def _auto_select_k_elbow(k_values: list[int], inertias: list[float]) -> int:
 def _visualize_clusters(
     feature_matrix: np.ndarray,
     cluster_labels: np.ndarray,
-    frame_key: str,
     k: int,
     output_dir: Path,
 ) -> None:
@@ -221,9 +213,8 @@ def _visualize_clusters(
     Args:
         feature_matrix: Scaled feature matrix (num_crops, num_features)
         cluster_labels: Cluster assignments for each crop
-        frame_key: Frame identifier for filename
         k: Number of clusters
-        output_dir: Directory to save visualizations
+        output_dir: Frame directory to save visualizations
     """
     # PCA projection (2D)
     pca = PCA(n_components=2, random_state=42)
@@ -242,7 +233,7 @@ def _visualize_clusters(
     )
     ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)', fontsize=11)
     ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)', fontsize=11)
-    ax.set_title(f'{frame_key} - PCA Projection (K={k})', fontsize=13, fontweight='bold')
+    ax.set_title(f'PCA Projection (K={k} clusters)', fontsize=13, fontweight='bold')
     ax.grid(alpha=0.3)
     
     # Add colorbar
@@ -250,7 +241,7 @@ def _visualize_clusters(
     cbar.set_label('Cluster ID', fontsize=11)
     
     plt.tight_layout()
-    pca_path = output_dir / f"{frame_key}_clusters_pca_k{k}.png"
+    pca_path = output_dir / "clusters_pca.png"
     plt.savefig(str(pca_path), dpi=150, bbox_inches='tight')
     plt.close(fig)
     
@@ -272,7 +263,7 @@ def _visualize_clusters(
         )
         ax.set_xlabel('UMAP 1', fontsize=11)
         ax.set_ylabel('UMAP 2', fontsize=11)
-        ax.set_title(f'{frame_key} - UMAP Projection (K={k})', fontsize=13, fontweight='bold')
+        ax.set_title(f'UMAP Projection (K={k} clusters)', fontsize=13, fontweight='bold')
         ax.grid(alpha=0.3)
         
         # Add colorbar
@@ -280,7 +271,7 @@ def _visualize_clusters(
         cbar.set_label('Cluster ID', fontsize=11)
         
         plt.tight_layout()
-        umap_path = output_dir / f"{frame_key}_clusters_umap_k{k}.png"
+        umap_path = output_dir / "clusters_umap.png"
         plt.savefig(str(umap_path), dpi=150, bbox_inches='tight')
         plt.close(fig)
 
@@ -289,7 +280,6 @@ def _visualize_elbow(
     k_values: list[int],
     inertias: list[float],
     optimal_k: int,
-    frame_key: str,
     output_dir: Path,
 ) -> None:
     """Generate elbow method visualization.
@@ -298,8 +288,7 @@ def _visualize_elbow(
         k_values: List of K values tested
         inertias: List of corresponding inertia values
         optimal_k: Selected optimal K value
-        frame_key: Frame identifier for filename
-        output_dir: Directory to save visualization
+        output_dir: Frame directory to save visualization
     """
     fig, ax = plt.subplots(figsize=(10, 6))
     
@@ -314,12 +303,12 @@ def _visualize_elbow(
     # Styling
     ax.set_xlabel('Number of Clusters (K)', fontsize=12)
     ax.set_ylabel('Inertia (Within-Cluster Sum of Squares)', fontsize=12)
-    ax.set_title(f'{frame_key} - Elbow Method for Optimal K', fontsize=14, fontweight='bold')
+    ax.set_title('Elbow Method for Optimal K', fontsize=14, fontweight='bold')
     ax.set_xticks(k_values)
     ax.grid(alpha=0.3)
     ax.legend(fontsize=11)
     
     plt.tight_layout()
-    elbow_path = output_dir / f"{frame_key}_elbow_method.png"
+    elbow_path = output_dir / "elbow_method.png"
     plt.savefig(str(elbow_path), dpi=150, bbox_inches='tight')
     plt.close(fig)
