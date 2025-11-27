@@ -19,7 +19,6 @@ def main():
     
     # Define paths
     input_video = r"./data/input/raw-video.mp4"
-    annotated_output = output_dir / "annotated-video.mp4"
     tracked_output = output_dir / "tracked-video.mp4"
     
     # Option 1: Frame-by-frame inference with annotations
@@ -28,8 +27,10 @@ def main():
     
     for idx, result in enumerate(run_yolo_on_video(
         input_path=input_video,
-        output_path=str(annotated_output),
+        output_dir=str(output_dir),
         save_annotated=True,
+        save_crops=True,
+        frames=[24, 48, 72],
         device=device
     )):
         frame_count = idx + 1
@@ -45,7 +46,7 @@ def main():
     print(f"Frames processed: {frame_count}")
     print(f"Time elapsed: {elapsed_ms:.2f} ms ({elapsed_ms/1000:.2f} seconds)")
     print(f"Processing speed: {fps:.2f} FPS")
-    print(f"Annotated video saved to {annotated_output}")
+    print(f"Output saved to {output_dir}")
     print(f"{'='*60}")
     
     # Option 2: Tracking mode with persistent IDs
