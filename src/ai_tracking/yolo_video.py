@@ -239,32 +239,40 @@ class YoloVideoRunner:
                         annotated_frame = result.plot()  # BGR ndarray ready for VideoWriter
                         writer.write(annotated_frame)
 
-                    # Extract and save crops if enabled
-                    if self.save_crops and self.output_dir:
-                        # Create frame-specific directory
-                        frame_dir = self.output_dir / f"frame_{frame_idx:04d}"
-                        frame_dir.mkdir(parents=True, exist_ok=True)
-                        
-                        # Save the full frame image
-                        frame_filename = f"frame_{frame_idx:04d}.jpg"
-                        frame_path = frame_dir / frame_filename
-                        cv2.imwrite(str(frame_path), frame)
-                        
-                        # Extract and save crops
+                    # Extract crops and compute histograms if clustering is enabled or crops need to be saved
+                    if (self.run_clustering or self.save_crops) and self.output_dir:
+                        # Extract crops in memory
                         crops_with_meta = extract_person_crops_from_frame(frame, result)
                         frame_crops = []
+                        
+                        # Prepare frame directory if saving to disk
+                        frame_dir = None
+                        frame_filename = None
+                        if self.save_crops:
+                            frame_dir = self.output_dir / f"frame_{frame_idx:04d}"
+                            frame_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            # Save the full frame image
+                            frame_filename = f"frame_{frame_idx:04d}.jpg"
+                            frame_path = frame_dir / frame_filename
+                            cv2.imwrite(str(frame_path), frame)
+                        
+                        # Process each crop
                         for crop_idx, (crop, meta) in enumerate(crops_with_meta, start=1):
                             crop_filename = f"crop_{crop_idx:04d}.jpg"
-                            crop_path = frame_dir / crop_filename
-                            cv2.imwrite(str(crop_path), crop)
-
-                            # Compute HSV histogram for the crop
+                            
+                            # Save crop image to disk if enabled
+                            if self.save_crops and frame_dir:
+                                crop_path = frame_dir / crop_filename
+                                cv2.imwrite(str(crop_path), crop)
+                            
+                            # Compute HSV histogram (always when clustering or save_crops enabled)
                             hsv_hist = compute_hsv_histogram(crop)
                             meta["hsv_hist"] = hsv_hist
                             meta["filename"] = crop_filename
                             
                             # Optionally save histogram visualization
-                            if visualize_histograms:
+                            if visualize_histograms and self.save_crops and frame_dir:
                                 _save_histogram_visualization(
                                     hsv_hist,
                                     frame_dir / f"crop_{crop_idx:04d}_hist.png"
@@ -276,7 +284,7 @@ class YoloVideoRunner:
                         frame_key = f"frame_{frame_idx:04d}"
                         frames_metadata[frame_key] = {
                             "frame_idx": frame_idx,
-                            "frame_filename": frame_filename,
+                            "frame_filename": frame_filename if self.save_crops else None,
                             "num_crops": len(frame_crops),
                             "crops": frame_crops,
                         }
@@ -294,8 +302,9 @@ class YoloVideoRunner:
             if writer is not None:
                 writer.release()
 
-            # Save crops metadata JSON if any crops were saved
-            if self.save_crops and self.output_dir and frames_metadata:
+            # Process metadata and clustering if any frames were analyzed
+            if self.output_dir and frames_metadata:
+                # Build metadata summary
                 json_path = self.output_dir / "crops_metadata.json"
                 total_crops = sum(frame_data["num_crops"] for frame_data in frames_metadata.values())
                 metadata_summary = {
@@ -304,8 +313,6 @@ class YoloVideoRunner:
                     "total_crops": total_crops,
                     "frames": frames_metadata,
                 }
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(metadata_summary, f, indent=2)
                 
                 # Run clustering if enabled
                 if self.run_clustering:
@@ -319,11 +326,15 @@ class YoloVideoRunner:
                         output_dir=self.output_dir,
                         debug_plots=True,
                     )
-                    
-                    # Save updated metadata with cluster_id
+                
+                # Save metadata JSON (always when clustering or save_crops enabled)
+                if self.save_crops or self.run_clustering:
                     with open(json_path, "w", encoding="utf-8") as f:
                         json.dump(metadata_summary, f, indent=2)
-                    print(f"Metadata updated with cluster assignments: {json_path}")
+                    if self.run_clustering:
+                        print(f"Metadata updated with cluster assignments: {json_path}")
+                    else:
+                        print(f"Metadata saved to: {json_path}")
 
     def _build_writer(self, video_path: Path, cap: cv2.VideoCapture) -> cv2.VideoWriter:
         output_path = self.annotated_path or video_path.with_name(
@@ -433,6 +444,9 @@ def run_yolo_on_video(
     
     if save_crops and output_dir_path is None:
         raise ValueError("output_dir is required when save_crops=True")
+    
+    if run_clustering and output_dir_path is None:
+        raise ValueError("output_dir is required when run_clustering=True")
 
     runner = YoloVideoRunner(
         model_source=model_source,
