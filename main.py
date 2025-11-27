@@ -31,7 +31,10 @@ def main():
         save_annotated=True,
         save_crops=True,
         frames=[24, 48, 72],
-        device=device
+        device=device,
+        run_clustering=True,
+        clustering_k_min=2,
+        clustering_k_max=5,
     )):
         frame_count = idx + 1
         num_detections = len(result.boxes) if result.boxes else 0

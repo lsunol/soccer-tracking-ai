@@ -155,6 +155,9 @@ class YoloVideoRunner:
         save_crops: bool = False,
         output_dir: Optional[str | Path] = None,
         visualize_histograms: Optional[bool] = None,
+        run_clustering: bool = False,
+        clustering_k_min: int = 2,
+        clustering_k_max: int = 5,
     ) -> None:
         self.model_source = model_source
         self.device = device
@@ -166,6 +169,9 @@ class YoloVideoRunner:
         self.save_crops = save_crops
         self.output_dir = Path(output_dir) if output_dir else None
         self._visualize_histograms = visualize_histograms
+        self.run_clustering = run_clustering
+        self.clustering_k_min = clustering_k_min
+        self.clustering_k_max = clustering_k_max
         self._model: Optional[YOLO] = None
 
     @property
@@ -300,6 +306,24 @@ class YoloVideoRunner:
                 }
                 with open(json_path, "w", encoding="utf-8") as f:
                     json.dump(metadata_summary, f, indent=2)
+                
+                # Run clustering if enabled
+                if self.run_clustering:
+                    print("\nRunning HSV clustering...")
+                    from .clustering import run_hsv_clustering
+                    
+                    metadata_summary = run_hsv_clustering(
+                        metadata_summary,
+                        k_min=self.clustering_k_min,
+                        k_max=self.clustering_k_max,
+                        output_dir=self.output_dir,
+                        debug_plots=True,
+                    )
+                    
+                    # Save updated metadata with cluster_id
+                    with open(json_path, "w", encoding="utf-8") as f:
+                        json.dump(metadata_summary, f, indent=2)
+                    print(f"Metadata updated with cluster assignments: {json_path}")
 
     def _build_writer(self, video_path: Path, cap: cv2.VideoCapture) -> cv2.VideoWriter:
         output_path = self.annotated_path or video_path.with_name(
@@ -377,6 +401,9 @@ def run_yolo_on_video(
     annotated_fourcc: str = "mp4v",
     save_crops: bool = False,
     visualize_histograms: Optional[bool] = None,
+    run_clustering: bool = False,
+    clustering_k_min: int = 2,
+    clustering_k_max: int = 5,
 ) -> Iterator[Any]:
     """Yield raw YOLO detections and optionally save annotated video and/or person crops.
     
@@ -391,6 +418,9 @@ def run_yolo_on_video(
         annotated_fourcc: Video codec fourcc code
         save_crops: Whether to save person crops and full frames to disk
         visualize_histograms: Whether to save histogram visualizations. If None, auto-enabled when frames is not None (debug mode).
+        run_clustering: Whether to run K-Means clustering on HSV histograms after processing all frames
+        clustering_k_min: Minimum number of clusters to try (default: 2)
+        clustering_k_max: Maximum number of clusters to try (default: 5)
     """
     output_dir_path = Path(output_dir) if output_dir else None
     
@@ -415,6 +445,9 @@ def run_yolo_on_video(
         save_crops=save_crops,
         output_dir=output_dir_path,
         visualize_histograms=visualize_histograms,
+        run_clustering=run_clustering,
+        clustering_k_min=clustering_k_min,
+        clustering_k_max=clustering_k_max,
     )
     yield from runner.run(input_path, frames=frames)
 
