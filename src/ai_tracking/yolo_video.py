@@ -148,8 +148,7 @@ class YoloVideoRunner:
         *,
         device: Optional[str] = None,
         yolo_kwargs: Optional[dict[str, Any]] = None,
-        output_video_path: Optional[str | Path] = None,
-        annotated_fourcc: str = "mp4v",
+        video_fourcc: str = "mp4v",
         debug: bool = False,
         output_dir: Optional[str | Path] = None,
         clustering_k_min: int = 2,
@@ -158,8 +157,7 @@ class YoloVideoRunner:
         self.model_source = model_source
         self.device = device
         self.yolo_kwargs = {"classes": [0], **(yolo_kwargs or {})}
-        self.output_video_path = Path(output_video_path) if output_video_path else None
-        self.annotated_fourcc = annotated_fourcc
+        self.video_fourcc = video_fourcc
         self.debug = debug
         self.output_dir = Path(output_dir) if output_dir else None
         self.clustering_k_min = clustering_k_min
@@ -197,16 +195,28 @@ class YoloVideoRunner:
         if frames is not None:
             target_frames = {frames} if isinstance(frames, int) else set(frames)
 
-        writer = None
-        if self.output_video_path:
+        # Prepare video writers
+        yolo_writer = None
+        output_writer = None
+        if self.debug:
             try:
-                writer = self._build_writer(video_path, cap)
+                yolo_writer = self._build_yolo_writer(video_path, cap)
             except Exception:
                 cap.release()
+                raise
+        
+        if self.output_dir:
+            try:
+                output_writer = self._build_output_writer(cap)
+            except Exception:
+                cap.release()
+                if yolo_writer:
+                    yolo_writer.release()
                 raise
 
         frame_idx = 0
         frames_metadata: dict[str, dict[str, Any]] = {}
+        frames_for_clustering: dict[int, np.ndarray] = {}  # Store original frames for later processing
 
         try:
             while True:
@@ -222,12 +232,17 @@ class YoloVideoRunner:
                 results = self.model(frame, verbose=False, **self.yolo_kwargs)
                 # YOLO returns a list of Results even for a single frame.
                 for result in results:
-                    if writer is not None:
+                    # Save YOLO annotated frame in debug mode
+                    if yolo_writer is not None:
                         annotated_frame = result.plot()  # BGR ndarray ready for VideoWriter
-                        writer.write(annotated_frame)
+                        yolo_writer.write(annotated_frame)
 
                     # Always extract crops and compute histograms for clustering
                     crops_with_meta = extract_person_crops_from_frame(frame, result)
+                    
+                    # Store frame for later clustering visualization
+                    if output_writer is not None:
+                        frames_for_clustering[frame_idx] = frame.copy()
                     frame_crops = []
                     
                     # Prepare frame directory if debug mode is enabled
@@ -284,10 +299,10 @@ class YoloVideoRunner:
 
         finally:
             cap.release()
-            if writer is not None:
-                writer.release()
+            if yolo_writer is not None:
+                yolo_writer.release()
 
-            # Process metadata and clustering if any frames were analyzed
+            # Process clustering and generate output video
             if frames_metadata:
                 # Build metadata summary
                 total_crops = sum(frame_data["num_crops"] for frame_data in frames_metadata.values())
@@ -309,6 +324,17 @@ class YoloVideoRunner:
                     debug_plots=self.debug,
                 )
                 
+                # Generate output video with cluster-colored bounding boxes
+                if output_writer is not None:
+                    print("\nGenerating output video with cluster colors...")
+                    self._generate_cluster_video(
+                        frames_for_clustering,
+                        metadata_summary,
+                        output_writer
+                    )
+                    output_writer.release()
+                    print(f"Output video saved to: {self.output_dir / 'output-video.mp4'}")
+                
                 # Save metadata JSON in debug mode
                 if self.debug and self.output_dir:
                     json_path = self.output_dir / "crops_metadata.json"
@@ -316,18 +342,104 @@ class YoloVideoRunner:
                         json.dump(metadata_summary, f, indent=2)
                     print(f"Metadata saved to: {json_path}")
 
-    def _build_writer(self, video_path: Path, cap: cv2.VideoCapture) -> cv2.VideoWriter:
-        output_path = self.output_video_path or video_path.with_name(
-            f"{video_path.stem}_output{video_path.suffix}"
-        )
+    def _build_yolo_writer(self, video_path: Path, cap: cv2.VideoCapture) -> cv2.VideoWriter:
+        """Build video writer for YOLO annotated frames (debug only)."""
+        if not self.output_dir:
+            raise ValueError("output_dir required for YOLO video")
+        
+        output_path = self.output_dir / "yolo-video.mp4"
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
-        fourcc = cv2.VideoWriter_fourcc(*self.annotated_fourcc)  # type: ignore[attr-defined]
+        fourcc = cv2.VideoWriter_fourcc(*self.video_fourcc)  # type: ignore[attr-defined]
         writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
         if not writer.isOpened():
-            raise RuntimeError(f"Unable to create annotated video at: {output_path}")
+            raise RuntimeError(f"Unable to create YOLO video at: {output_path}")
         return writer
+    
+    def _build_output_writer(self, cap: cv2.VideoCapture) -> cv2.VideoWriter:
+        """Build video writer for cluster-colored output video."""
+        if not self.output_dir:
+            raise ValueError("output_dir required for output video")
+        
+        output_path = self.output_dir / "output-video.mp4"
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+        fourcc = cv2.VideoWriter_fourcc(*self.video_fourcc)  # type: ignore[attr-defined]
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+        if not writer.isOpened():
+            raise RuntimeError(f"Unable to create output video at: {output_path}")
+        return writer
+    
+    def _generate_cluster_video(
+        self,
+        frames: dict[int, np.ndarray],
+        metadata: dict[str, Any],
+        writer: cv2.VideoWriter,
+    ) -> None:
+        """Generate output video with cluster-colored bounding boxes.
+        
+        Args:
+            frames: Dictionary mapping frame_idx to original frame
+            metadata: Metadata with cluster assignments
+            writer: VideoWriter for output video
+        """
+        import matplotlib.pyplot as plt
+        
+        # Get cluster colors from tab10 colormap (same as PCA visualization)
+        # We need to find max K across all frames
+        max_k = 0
+        for frame_data in metadata["frames"].values():
+            if "clustering" in frame_data:
+                max_k = max(max_k, frame_data["clustering"]["optimal_k"])
+        
+        # Generate colors (BGR format for OpenCV)
+        cluster_colors_rgb = plt.cm.tab10.colors[:max_k]
+        cluster_colors_bgr = [
+            (int(rgb[2] * 255), int(rgb[1] * 255), int(rgb[0] * 255))
+            for rgb in cluster_colors_rgb
+        ]
+        
+        # Process frames in order
+        for frame_idx in sorted(frames.keys()):
+            frame = frames[frame_idx].copy()
+            frame_key = f"frame_{frame_idx:04d}"
+            frame_data = metadata["frames"].get(frame_key)
+            
+            if frame_data and "crops" in frame_data:
+                # Draw cluster-colored rectangles
+                for crop_meta in frame_data["crops"]:
+                    bbox = crop_meta["bbox"]
+                    cluster_id = crop_meta.get("cluster_id", 0)
+                    
+                    x1, y1, x2, y2 = bbox
+                    color = cluster_colors_bgr[cluster_id]
+                    
+                    # Draw rectangle with cluster color
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
+                    
+                    # Draw cluster ID label
+                    label = f"C{cluster_id}"
+                    label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(
+                        frame,
+                        (x1, y1 - label_size[1] - 8),
+                        (x1 + label_size[0] + 4, y1),
+                        color,
+                        -1
+                    )
+                    cv2.putText(
+                        frame,
+                        label,
+                        (x1 + 2, y1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                    )
+            
+            writer.write(frame)
 
 
 def extract_person_crops_from_frame(
@@ -383,8 +495,7 @@ def extract_person_crops_from_frame(
 def run_yolo_on_video(
     input_path: str | Path,
     *,
-    output_video_path: Optional[str | Path] = None,
-    output_dir: Optional[str | Path] = None,
+    output_dir: str | Path,
     frames: Optional[int | list[int]] = None,
     model_source: str = "yolov8n.pt",
     device: Optional[str] = None,
@@ -398,31 +509,23 @@ def run_yolo_on_video(
     
     Args:
         input_path: Path to input video file
-        output_video_path: Path where output video with team labels will be saved
-        output_dir: Directory for debug outputs (frame folders, crops, visualizations, metadata JSON)
+        output_dir: Directory where output-video.mp4 will be saved (and debug files if debug=True)
         frames: Optional frame index (int) or list of frame indices to process. If None, process all frames.
         model_source: YOLO model weights to load
         device: Device to run inference on
         yolo_kwargs: Additional kwargs for YOLO inference
         video_fourcc: Video codec fourcc code
-        debug: If True, save crops, histograms, clustering plots, and metadata to disk for analysis
+        debug: If True, save crops, histograms, clustering plots, yolo-video.mp4, and metadata to disk
         clustering_k_min: Minimum number of clusters to try (default: 2)
         clustering_k_max: Maximum number of clusters to try (default: 5)
     """
-    output_dir_path = Path(output_dir) if output_dir else None
-    
-    if output_video_path is None:
-        raise ValueError("output_video_path is required")
-    
-    if debug and output_dir_path is None:
-        raise ValueError("output_dir is required when debug=True")
+    output_dir_path = Path(output_dir)
 
     runner = YoloVideoRunner(
         model_source=model_source,
         device=device,
         yolo_kwargs=yolo_kwargs,
-        output_video_path=output_video_path,
-        annotated_fourcc=video_fourcc,
+        video_fourcc=video_fourcc,
         debug=debug,
         output_dir=output_dir_path,
         clustering_k_min=clustering_k_min,
