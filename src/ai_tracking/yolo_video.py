@@ -19,16 +19,21 @@ def compute_hsv_histogram(
     h_bins: int = 8,
     s_bins: int = 4,
     v_bins: int = 4,
-    shirt_region_ratio: float = 0.5,
+    torso_height_ratio: float = 0.4,
+    torso_width_ratio: float = 0.6,
 ) -> list[float]:
-    """Calculate normalized HSV histogram from the upper portion (shirt region) of a person crop.
+    """Calculate normalized HSV histogram from a central torso region of a person crop.
+    
+    Extracts a centered rectangular region representing the player's shirt/jersey to minimize
+    grass contamination from wide leg stances or background elements.
     
     Args:
         crop: BGR image as numpy array (from OpenCV)
         h_bins: Number of bins for Hue channel (0-180 in OpenCV)
         s_bins: Number of bins for Saturation channel (0-255)
         v_bins: Number of bins for Value channel (0-255)
-        shirt_region_ratio: Proportion of upper crop to analyze (0.5 = top 50%)
+        torso_height_ratio: Proportion of crop height for torso region (0.4 = central 40%)
+        torso_width_ratio: Proportion of crop width for torso region (0.6 = central 60%)
         
     Returns:
         Normalized histogram as 1D list of floats (length = h_bins * s_bins * v_bins)
@@ -37,15 +42,27 @@ def compute_hsv_histogram(
         # Return zero vector for empty crops
         return [0.0] * (h_bins * s_bins * v_bins)
     
-    # Extract upper region (shirt area)
-    height = crop.shape[0]
-    shirt_height = int(height * shirt_region_ratio)
-    if shirt_height == 0:
-        shirt_height = 1
-    shirt_region = crop[:shirt_height, :]
+    # Calculate torso region dimensions
+    height, width = crop.shape[:2]
+    
+    torso_height = int(height * torso_height_ratio)
+    torso_width = int(width * torso_width_ratio)
+    
+    # Ensure minimum dimensions
+    if torso_height == 0:
+        torso_height = 1
+    if torso_width == 0:
+        torso_width = 1
+    
+    # Center the torso region
+    y_start = (height - torso_height) // 2
+    x_start = (width - torso_width) // 2
+    
+    # Extract centered torso region
+    torso_region = crop[y_start:y_start + torso_height, x_start:x_start + torso_width]
     
     # Convert to HSV
-    hsv = cv2.cvtColor(shirt_region, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(torso_region, cv2.COLOR_BGR2HSV)
     
     # Calculate 3D histogram
     hist = cv2.calcHist(
@@ -153,6 +170,8 @@ class YoloVideoRunner:
         output_dir: Optional[str | Path] = None,
         clustering_k_min: int = 2,
         clustering_k_max: int = 5,
+        torso_height_ratio: float = 0.4,
+        torso_width_ratio: float = 0.6,
     ) -> None:
         self.model_source = model_source
         self.device = device
@@ -162,6 +181,8 @@ class YoloVideoRunner:
         self.output_dir = Path(output_dir) if output_dir else None
         self.clustering_k_min = clustering_k_min
         self.clustering_k_max = clustering_k_max
+        self.torso_height_ratio = torso_height_ratio
+        self.torso_width_ratio = torso_width_ratio
         self._model: Optional[YOLO] = None
 
     @property
@@ -264,7 +285,11 @@ class YoloVideoRunner:
                             cv2.imwrite(str(crop_path), crop)
                         
                         # Always compute HSV histogram for clustering
-                        hsv_hist = compute_hsv_histogram(crop)
+                        hsv_hist = compute_hsv_histogram(
+                            crop,
+                            torso_height_ratio=self.torso_height_ratio,
+                            torso_width_ratio=self.torso_width_ratio,
+                        )
                         meta["hsv_hist"] = hsv_hist
                         meta["filename"] = crop_filename
                         
