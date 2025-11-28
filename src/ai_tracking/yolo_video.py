@@ -140,7 +140,7 @@ def _save_histogram_visualization(
 
 
 class YoloVideoRunner:
-    """Execute YOLO on each frame of a video, optionally persisting annotated frames and crops."""
+    """Execute YOLO on each frame of a video, generating team-labeled output video."""
 
     def __init__(
         self,
@@ -148,28 +148,20 @@ class YoloVideoRunner:
         *,
         device: Optional[str] = None,
         yolo_kwargs: Optional[dict[str, Any]] = None,
-        save_annotated: bool = False,
-        annotated_suffix: str = "_annotated",
-        annotated_path: Optional[str | Path] = None,
+        output_video_path: Optional[str | Path] = None,
         annotated_fourcc: str = "mp4v",
-        save_crops: bool = False,
+        debug: bool = False,
         output_dir: Optional[str | Path] = None,
-        visualize_histograms: Optional[bool] = None,
-        run_clustering: bool = False,
         clustering_k_min: int = 2,
         clustering_k_max: int = 5,
     ) -> None:
         self.model_source = model_source
         self.device = device
         self.yolo_kwargs = {"classes": [0], **(yolo_kwargs or {})}
-        self.save_annotated = save_annotated
-        self.annotated_suffix = annotated_suffix
-        self.annotated_path = Path(annotated_path) if annotated_path else None
+        self.output_video_path = Path(output_video_path) if output_video_path else None
         self.annotated_fourcc = annotated_fourcc
-        self.save_crops = save_crops
+        self.debug = debug
         self.output_dir = Path(output_dir) if output_dir else None
-        self._visualize_histograms = visualize_histograms
-        self.run_clustering = run_clustering
         self.clustering_k_min = clustering_k_min
         self.clustering_k_max = clustering_k_max
         self._model: Optional[YOLO] = None
@@ -188,17 +180,12 @@ class YoloVideoRunner:
         video_path: str | Path,
         frames: Optional[int | list[int]] = None,
     ) -> Iterator[Any]:
-        # Auto-enable histogram visualization in debug mode (when frames is specified)
-        visualize = self._visualize_histograms
-        if visualize is None:
-            visualize = frames is not None
-        return self._inference_generator(Path(video_path), frames, visualize)
+        return self._inference_generator(Path(video_path), frames)
 
     def _inference_generator(
         self,
         video_path: Path,
         frames: Optional[int | list[int]] = None,
-        visualize_histograms: bool = False,
     ) -> Generator[Any, None, None]:
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -211,7 +198,7 @@ class YoloVideoRunner:
             target_frames = {frames} if isinstance(frames, int) else set(frames)
 
         writer = None
-        if self.save_annotated:
+        if self.output_video_path:
             try:
                 writer = self._build_writer(video_path, cap)
             except Exception:
@@ -239,55 +226,53 @@ class YoloVideoRunner:
                         annotated_frame = result.plot()  # BGR ndarray ready for VideoWriter
                         writer.write(annotated_frame)
 
-                    # Extract crops and compute histograms if clustering is enabled or crops need to be saved
-                    if (self.run_clustering or self.save_crops) and self.output_dir:
-                        # Extract crops in memory
-                        crops_with_meta = extract_person_crops_from_frame(frame, result)
-                        frame_crops = []
+                    # Always extract crops and compute histograms for clustering
+                    crops_with_meta = extract_person_crops_from_frame(frame, result)
+                    frame_crops = []
+                    
+                    # Prepare frame directory if debug mode is enabled
+                    frame_dir = None
+                    frame_filename = None
+                    if self.debug and self.output_dir:
+                        frame_dir = self.output_dir / f"frame_{frame_idx:04d}"
+                        frame_dir.mkdir(parents=True, exist_ok=True)
                         
-                        # Prepare frame directory if saving to disk
-                        frame_dir = None
-                        frame_filename = None
-                        if self.save_crops:
-                            frame_dir = self.output_dir / f"frame_{frame_idx:04d}"
-                            frame_dir.mkdir(parents=True, exist_ok=True)
-                            
-                            # Save the full frame image
-                            frame_filename = f"frame_{frame_idx:04d}.jpg"
-                            frame_path = frame_dir / frame_filename
-                            cv2.imwrite(str(frame_path), frame)
+                        # Save the full frame image
+                        frame_filename = f"frame_{frame_idx:04d}.jpg"
+                        frame_path = frame_dir / frame_filename
+                        cv2.imwrite(str(frame_path), frame)
+                    
+                    # Process each crop
+                    for crop_idx, (crop, meta) in enumerate(crops_with_meta, start=1):
+                        crop_filename = f"crop_{crop_idx:04d}.jpg"
                         
-                        # Process each crop
-                        for crop_idx, (crop, meta) in enumerate(crops_with_meta, start=1):
-                            crop_filename = f"crop_{crop_idx:04d}.jpg"
-                            
-                            # Save crop image to disk if enabled
-                            if self.save_crops and frame_dir:
-                                crop_path = frame_dir / crop_filename
-                                cv2.imwrite(str(crop_path), crop)
-                            
-                            # Compute HSV histogram (always when clustering or save_crops enabled)
-                            hsv_hist = compute_hsv_histogram(crop)
-                            meta["hsv_hist"] = hsv_hist
-                            meta["filename"] = crop_filename
-                            
-                            # Optionally save histogram visualization
-                            if visualize_histograms and self.save_crops and frame_dir:
-                                _save_histogram_visualization(
-                                    hsv_hist,
-                                    frame_dir / f"crop_{crop_idx:04d}_hist.png"
-                                )
-                            
-                            frame_crops.append(meta)
+                        # Save crop image to disk if debug mode
+                        if self.debug and frame_dir:
+                            crop_path = frame_dir / crop_filename
+                            cv2.imwrite(str(crop_path), crop)
                         
-                        # Store frame metadata with its crops
-                        frame_key = f"frame_{frame_idx:04d}"
-                        frames_metadata[frame_key] = {
-                            "frame_idx": frame_idx,
-                            "frame_filename": frame_filename if self.save_crops else None,
-                            "num_crops": len(frame_crops),
-                            "crops": frame_crops,
-                        }
+                        # Always compute HSV histogram for clustering
+                        hsv_hist = compute_hsv_histogram(crop)
+                        meta["hsv_hist"] = hsv_hist
+                        meta["filename"] = crop_filename
+                        
+                        # Save histogram visualization in debug mode
+                        if self.debug and frame_dir:
+                            _save_histogram_visualization(
+                                hsv_hist,
+                                frame_dir / f"crop_{crop_idx:04d}_hist.png"
+                            )
+                        
+                        frame_crops.append(meta)
+                    
+                    # Store frame metadata with its crops
+                    frame_key = f"frame_{frame_idx:04d}"
+                    frames_metadata[frame_key] = {
+                        "frame_idx": frame_idx,
+                        "frame_filename": frame_filename if self.debug else None,
+                        "num_crops": len(frame_crops),
+                        "crops": frame_crops,
+                    }
 
                     yield result
 
@@ -303,9 +288,8 @@ class YoloVideoRunner:
                 writer.release()
 
             # Process metadata and clustering if any frames were analyzed
-            if self.output_dir and frames_metadata:
+            if frames_metadata:
                 # Build metadata summary
-                json_path = self.output_dir / "crops_metadata.json"
                 total_crops = sum(frame_data["num_crops"] for frame_data in frames_metadata.values())
                 metadata_summary = {
                     "video_path": str(video_path),
@@ -314,28 +298,27 @@ class YoloVideoRunner:
                     "frames": frames_metadata,
                 }
                 
-                # Run clustering if enabled
-                if self.run_clustering:
-                    print("\nRunning HSV clustering...")
-                    from .clustering import run_hsv_clustering
-                    
-                    metadata_summary = run_hsv_clustering(
-                        metadata_summary,
-                        k_min=self.clustering_k_min,
-                        k_max=self.clustering_k_max,
-                        output_dir=self.output_dir,
-                        debug_plots=True,
-                    )
+                print("\nRunning HSV clustering...")
+                from .clustering import run_hsv_clustering
                 
-                # Save metadata JSON (always when clustering or save_crops enabled)
-                if self.save_crops or self.run_clustering:
+                metadata_summary = run_hsv_clustering(
+                    metadata_summary,
+                    k_min=self.clustering_k_min,
+                    k_max=self.clustering_k_max,
+                    output_dir=self.output_dir,
+                    debug_plots=self.debug,
+                )
+                
+                # Save metadata JSON in debug mode
+                if self.debug and self.output_dir:
+                    json_path = self.output_dir / "crops_metadata.json"
                     with open(json_path, "w", encoding="utf-8") as f:
                         json.dump(metadata_summary, f, indent=2)
                     print(f"Metadata saved to: {json_path}")
 
     def _build_writer(self, video_path: Path, cap: cv2.VideoCapture) -> cv2.VideoWriter:
-        output_path = self.annotated_path or video_path.with_name(
-            f"{video_path.stem}{self.annotated_suffix}{video_path.suffix}"
+        output_path = self.output_video_path or video_path.with_name(
+            f"{video_path.stem}_output{video_path.suffix}"
         )
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
@@ -400,63 +383,48 @@ def extract_person_crops_from_frame(
 def run_yolo_on_video(
     input_path: str | Path,
     *,
+    output_video_path: Optional[str | Path] = None,
     output_dir: Optional[str | Path] = None,
     frames: Optional[int | list[int]] = None,
     model_source: str = "yolov8n.pt",
     device: Optional[str] = None,
     yolo_kwargs: Optional[dict[str, Any]] = None,
-    save_annotated: bool = False,
-    annotated_fourcc: str = "mp4v",
-    save_crops: bool = False,
-    visualize_histograms: Optional[bool] = None,
-    run_clustering: bool = False,
+    video_fourcc: str = "mp4v",
+    debug: bool = False,
     clustering_k_min: int = 2,
     clustering_k_max: int = 5,
 ) -> Iterator[Any]:
-    """Yield raw YOLO detections and optionally save annotated video and/or person crops.
+    """Process video with YOLO detection and team clustering, generating labeled output video.
     
     Args:
         input_path: Path to input video file
-        output_dir: Directory where outputs (annotated video, frame folders, crops_metadata.json) will be saved
+        output_video_path: Path where output video with team labels will be saved
+        output_dir: Directory for debug outputs (frame folders, crops, visualizations, metadata JSON)
         frames: Optional frame index (int) or list of frame indices to process. If None, process all frames.
         model_source: YOLO model weights to load
         device: Device to run inference on
         yolo_kwargs: Additional kwargs for YOLO inference
-        save_annotated: Whether to save annotated frames to video
-        annotated_fourcc: Video codec fourcc code
-        save_crops: Whether to save person crops and full frames to disk
-        visualize_histograms: Whether to save histogram visualizations. If None, auto-enabled when frames is not None (debug mode).
-        run_clustering: Whether to run K-Means clustering on HSV histograms after processing all frames
+        video_fourcc: Video codec fourcc code
+        debug: If True, save crops, histograms, clustering plots, and metadata to disk for analysis
         clustering_k_min: Minimum number of clusters to try (default: 2)
         clustering_k_max: Maximum number of clusters to try (default: 5)
     """
     output_dir_path = Path(output_dir) if output_dir else None
     
-    # Determine annotated video path if needed
-    annotated_path = None
-    if save_annotated:
-        if output_dir_path is None:
-            raise ValueError("output_dir is required when save_annotated=True")
-        annotated_path = output_dir_path / "annotated-video.mp4"
+    if output_video_path is None:
+        raise ValueError("output_video_path is required")
     
-    if save_crops and output_dir_path is None:
-        raise ValueError("output_dir is required when save_crops=True")
-    
-    if run_clustering and output_dir_path is None:
-        raise ValueError("output_dir is required when run_clustering=True")
+    if debug and output_dir_path is None:
+        raise ValueError("output_dir is required when debug=True")
 
     runner = YoloVideoRunner(
         model_source=model_source,
         device=device,
         yolo_kwargs=yolo_kwargs,
-        save_annotated=save_annotated,
-        annotated_suffix="",
-        annotated_path=annotated_path,
-        annotated_fourcc=annotated_fourcc,
-        save_crops=save_crops,
+        output_video_path=output_video_path,
+        annotated_fourcc=video_fourcc,
+        debug=debug,
         output_dir=output_dir_path,
-        visualize_histograms=visualize_histograms,
-        run_clustering=run_clustering,
         clustering_k_min=clustering_k_min,
         clustering_k_max=clustering_k_max,
     )

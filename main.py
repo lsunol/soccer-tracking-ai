@@ -27,12 +27,11 @@ def main():
     
     for idx, result in enumerate(run_yolo_on_video(
         input_path=input_video,
+        output_video_path=str(output_dir / "output-video.mp4"),
         output_dir=str(output_dir),
-        save_annotated=True,
-        save_crops=True,
         frames=[24, 48, 72],
         device=device,
-        run_clustering=True,
+        debug=True,
         clustering_k_min=2,
         clustering_k_max=5,
     )):
