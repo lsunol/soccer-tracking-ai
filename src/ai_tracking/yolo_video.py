@@ -215,8 +215,7 @@ class YoloVideoRunner:
                 raise
 
         frame_idx = 0
-        frames_metadata: dict[str, dict[str, Any]] = {}
-        frames_for_clustering: dict[int, np.ndarray] = {}  # Store original frames for later processing
+        frames_metadata: dict[str, dict[str, Any]] = {}  # Only used in debug mode
 
         try:
             while True:
@@ -239,17 +238,15 @@ class YoloVideoRunner:
 
                     # Always extract crops and compute histograms for clustering
                     crops_with_meta = extract_person_crops_from_frame(frame, result)
-                    
-                    # Store frame for later clustering visualization
-                    if output_writer is not None:
-                        frames_for_clustering[frame_idx] = frame.copy()
                     frame_crops = []
                     
                     # Prepare frame directory if debug mode is enabled
                     frame_dir = None
                     frame_filename = None
+                    frame_key = f"frame_{frame_idx:04d}"
+                    
                     if self.debug and self.output_dir:
-                        frame_dir = self.output_dir / f"frame_{frame_idx:04d}"
+                        frame_dir = self.output_dir / frame_key
                         frame_dir.mkdir(parents=True, exist_ok=True)
                         
                         # Save the full frame image
@@ -257,7 +254,7 @@ class YoloVideoRunner:
                         frame_path = frame_dir / frame_filename
                         cv2.imwrite(str(frame_path), frame)
                     
-                    # Process each crop
+                    # Process each crop and compute histograms
                     for crop_idx, (crop, meta) in enumerate(crops_with_meta, start=1):
                         crop_filename = f"crop_{crop_idx:04d}.jpg"
                         
@@ -280,14 +277,47 @@ class YoloVideoRunner:
                         
                         frame_crops.append(meta)
                     
-                    # Store frame metadata with its crops
-                    frame_key = f"frame_{frame_idx:04d}"
-                    frames_metadata[frame_key] = {
-                        "frame_idx": frame_idx,
-                        "frame_filename": frame_filename if self.debug else None,
-                        "num_crops": len(frame_crops),
-                        "crops": frame_crops,
-                    }
+                    # Perform clustering on this frame immediately
+                    from .clustering import cluster_single_frame
+                    
+                    cluster_labels, clustering_info = cluster_single_frame(
+                        frame_crops,
+                        k_min=self.clustering_k_min,
+                        k_max=self.clustering_k_max,
+                        output_dir=self.output_dir,
+                        frame_key=frame_key,
+                        debug_plots=self.debug,
+                    )
+                    
+                    # Assign cluster IDs to crops
+                    for i, label in enumerate(cluster_labels):
+                        frame_crops[i]["cluster_id"] = label
+                    
+                    # Generate and write output frame with cluster colors
+                    output_frame = None
+                    if output_writer is not None:
+                        output_frame = self._draw_cluster_boxes(
+                            frame.copy(),
+                            frame_crops,
+                            clustering_info.get("optimal_k", 1)
+                        )
+                        output_writer.write(output_frame)
+                        
+                        # Save clustered frame in debug mode
+                        if self.debug and frame_dir:
+                            clustered_filename = f"frame_{frame_idx:04d}_clustered.jpg"
+                            clustered_path = frame_dir / clustered_filename
+                            cv2.imwrite(str(clustered_path), output_frame)
+                    
+                    # Store frame metadata (optional, for debug JSON)
+                    if self.debug:
+                        frames_metadata[frame_key] = {
+                            "frame_idx": frame_idx,
+                            "frame_filename": frame_filename,
+                            "num_crops": len(frame_crops),
+                            "crops": frame_crops,
+                            "clustering": clustering_info,
+                        }
 
                     yield result
 
@@ -301,10 +331,13 @@ class YoloVideoRunner:
             cap.release()
             if yolo_writer is not None:
                 yolo_writer.release()
+            if output_writer is not None:
+                output_writer.release()
+                if self.output_dir:
+                    print(f"\nOutput video saved to: {self.output_dir / 'output-video.mp4'}")
 
-            # Process clustering and generate output video
-            if frames_metadata:
-                # Build metadata summary
+            # Save metadata JSON in debug mode
+            if self.debug and self.output_dir and frames_metadata:
                 total_crops = sum(frame_data["num_crops"] for frame_data in frames_metadata.values())
                 metadata_summary = {
                     "video_path": str(video_path),
@@ -313,34 +346,10 @@ class YoloVideoRunner:
                     "frames": frames_metadata,
                 }
                 
-                print("\nRunning HSV clustering...")
-                from .clustering import run_hsv_clustering
-                
-                metadata_summary = run_hsv_clustering(
-                    metadata_summary,
-                    k_min=self.clustering_k_min,
-                    k_max=self.clustering_k_max,
-                    output_dir=self.output_dir,
-                    debug_plots=self.debug,
-                )
-                
-                # Generate output video with cluster-colored bounding boxes
-                if output_writer is not None:
-                    print("\nGenerating output video with cluster colors...")
-                    self._generate_cluster_video(
-                        frames_for_clustering,
-                        metadata_summary,
-                        output_writer
-                    )
-                    output_writer.release()
-                    print(f"Output video saved to: {self.output_dir / 'output-video.mp4'}")
-                
-                # Save metadata JSON in debug mode
-                if self.debug and self.output_dir:
-                    json_path = self.output_dir / "crops_metadata.json"
-                    with open(json_path, "w", encoding="utf-8") as f:
-                        json.dump(metadata_summary, f, indent=2)
-                    print(f"Metadata saved to: {json_path}")
+                json_path = self.output_dir / "crops_metadata.json"
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(metadata_summary, f, indent=2)
+                print(f"Metadata saved to: {json_path}")
 
     def _build_yolo_writer(self, video_path: Path, cap: cv2.VideoCapture) -> cv2.VideoWriter:
         """Build video writer for YOLO annotated frames (debug only)."""
@@ -372,74 +381,63 @@ class YoloVideoRunner:
             raise RuntimeError(f"Unable to create output video at: {output_path}")
         return writer
     
-    def _generate_cluster_video(
+    def _draw_cluster_boxes(
         self,
-        frames: dict[int, np.ndarray],
-        metadata: dict[str, Any],
-        writer: cv2.VideoWriter,
-    ) -> None:
-        """Generate output video with cluster-colored bounding boxes.
+        frame: np.ndarray,
+        crops_data: list[dict[str, Any]],
+        max_k: int,
+    ) -> np.ndarray:
+        """Draw cluster-colored bounding boxes on frame.
         
         Args:
-            frames: Dictionary mapping frame_idx to original frame
-            metadata: Metadata with cluster assignments
-            writer: VideoWriter for output video
+            frame: Original frame to draw on
+            crops_data: List of crop metadata with bbox and cluster_id
+            max_k: Maximum number of clusters (for color selection)
+            
+        Returns:
+            Frame with drawn bounding boxes
         """
         import matplotlib.pyplot as plt
         
         # Get cluster colors from tab10 colormap (same as PCA visualization)
-        # We need to find max K across all frames
-        max_k = 0
-        for frame_data in metadata["frames"].values():
-            if "clustering" in frame_data:
-                max_k = max(max_k, frame_data["clustering"]["optimal_k"])
-        
-        # Generate colors (BGR format for OpenCV)
         cluster_colors_rgb = plt.cm.tab10.colors[:max_k]
         cluster_colors_bgr = [
             (int(rgb[2] * 255), int(rgb[1] * 255), int(rgb[0] * 255))
             for rgb in cluster_colors_rgb
         ]
         
-        # Process frames in order
-        for frame_idx in sorted(frames.keys()):
-            frame = frames[frame_idx].copy()
-            frame_key = f"frame_{frame_idx:04d}"
-            frame_data = metadata["frames"].get(frame_key)
+        # Draw cluster-colored rectangles
+        for crop_meta in crops_data:
+            bbox = crop_meta["bbox"]
+            cluster_id = crop_meta.get("cluster_id", 0)
             
-            if frame_data and "crops" in frame_data:
-                # Draw cluster-colored rectangles
-                for crop_meta in frame_data["crops"]:
-                    bbox = crop_meta["bbox"]
-                    cluster_id = crop_meta.get("cluster_id", 0)
-                    
-                    x1, y1, x2, y2 = bbox
-                    color = cluster_colors_bgr[cluster_id]
-                    
-                    # Draw rectangle with cluster color
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
-                    
-                    # Draw cluster ID label
-                    label = f"C{cluster_id}"
-                    label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    cv2.rectangle(
-                        frame,
-                        (x1, y1 - label_size[1] - 8),
-                        (x1 + label_size[0] + 4, y1),
-                        color,
-                        -1
-                    )
-                    cv2.putText(
-                        frame,
-                        label,
-                        (x1 + 2, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
-                        2,
-                    )
+            x1, y1, x2, y2 = bbox
+            color = cluster_colors_bgr[cluster_id]
             
-            writer.write(frame)
+            # Draw rectangle with cluster color (thickness 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            
+            # Draw cluster ID label
+            label = f"C{cluster_id}"
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(
+                frame,
+                (x1, y1 - label_size[1] - 8),
+                (x1 + label_size[0] + 4, y1),
+                color,
+                -1
+            )
+            cv2.putText(
+                frame,
+                label,
+                (x1 + 2, y1 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+            )
+        
+        return frame
 
 
 def extract_person_crops_from_frame(

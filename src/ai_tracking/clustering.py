@@ -15,141 +15,101 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 
 
-def run_hsv_clustering(
-    metadata: dict[str, Any],
+def cluster_single_frame(
+    crops_data: list[dict[str, Any]],
     k_min: int = 2,
     k_max: int = 5,
-    output_dir: Optional[str | Path] = None,
-    debug_plots: bool = True,
-) -> dict[str, Any]:
-    """Execute K-Means clustering on HSV histograms with elbow method for K selection.
-    
-    Performs clustering independently for each frame, applies elbow method to select
-    optimal K, and updates metadata with cluster assignments.
+    output_dir: Optional[Path] = None,
+    frame_key: Optional[str] = None,
+    debug_plots: bool = False,
+) -> tuple[list[int], dict[str, Any]]:
+    """Execute K-Means clustering on a single frame's crops.
     
     Args:
-        metadata: Crops metadata dict with hsv_hist features
+        crops_data: List of crop metadata dicts with hsv_hist field
         k_min: Minimum number of clusters to try
         k_max: Maximum number of clusters to try
-        output_dir: Directory to save visualizations and reports
-        debug_plots: Whether to generate PCA/UMAP visualizations
+        output_dir: Directory to save debug visualizations (frame subdir)
+        frame_key: Frame identifier for debug output
+        debug_plots: Whether to generate debug visualizations
         
     Returns:
-        Updated metadata dict with cluster_id field added to each crop and clustering info
+        Tuple of (cluster_labels, clustering_info_dict)
     """
-    output_path = Path(output_dir) if output_dir else None
+    num_crops = len(crops_data)
     
-    # Process each frame independently
-    for frame_key, frame_data in metadata["frames"].items():
-        print(f"Clustering {frame_key} ({frame_data['num_crops']} crops)...")
-        
-        # Determine frame directory for outputs
-        frame_dir = None
-        if output_path:
-            frame_dir = output_path / frame_key
-            frame_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Extract feature matrix
-        feature_matrix, crop_indices = _extract_feature_matrix(frame_data)
-        
-        if len(feature_matrix) < k_min:
-            print(f"  Skipping {frame_key}: only {len(feature_matrix)} crops (< k_min={k_min})")
-            # Assign all to cluster 0
-            for i in crop_indices:
-                frame_data["crops"][i]["cluster_id"] = 0
-            # Add minimal clustering info
-            frame_data["clustering"] = {
-                "optimal_k": 1,
-                "inertias_per_k": {},
-                "cluster_distribution": {"0": len(feature_matrix)}
-            }
-            continue
-        
-        # Normalize features
-        scaler = StandardScaler()
-        feature_matrix_scaled = scaler.fit_transform(feature_matrix)
-        
-        # Try different K values and compute metrics
-        k_range = range(k_min, min(k_max + 1, len(feature_matrix) + 1))
-        inertias = []
-        models = []
-        
-        for k in k_range:
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-            kmeans.fit(feature_matrix_scaled)
-            inertias.append(kmeans.inertia_)
-            models.append(kmeans)
-        
-        # Select optimal K using elbow method
-        optimal_k_idx = _auto_select_k_elbow(list(k_range), inertias)
-        optimal_k = list(k_range)[optimal_k_idx]
-        optimal_model = models[optimal_k_idx]
-        
-        print(f"  Optimal K selected: {optimal_k}")
-        
-        # Assign cluster IDs to crops
-        cluster_labels = optimal_model.labels_
-        for i, crop_idx in enumerate(crop_indices):
-            frame_data["crops"][crop_idx]["cluster_id"] = int(cluster_labels[i])
-        
-        # Build inertias_per_k dict
-        inertias_per_k = {str(k): inertia for k, inertia in zip(k_range, inertias)}
-        
-        # Add clustering metadata to frame
-        frame_data["clustering"] = {
-            "optimal_k": optimal_k,
-            "inertias_per_k": inertias_per_k,
-            "cluster_distribution": {
-                str(label): int(count) 
-                for label, count in zip(*np.unique(cluster_labels, return_counts=True))
-            }
+    # Handle edge cases
+    if num_crops == 0:
+        return [], {}
+    
+    if num_crops < k_min:
+        # Assign all to cluster 0
+        labels = [0] * num_crops
+        info = {
+            "optimal_k": 1,
+            "inertias_per_k": {},
+            "cluster_distribution": {"0": num_crops}
         }
+        return labels, info
+    
+    # Extract feature matrix
+    feature_matrix = np.array([crop["hsv_hist"] for crop in crops_data])
+    
+    # Normalize features
+    scaler = StandardScaler()
+    feature_matrix_scaled = scaler.fit_transform(feature_matrix)
+    
+    # Try different K values
+    k_range = range(k_min, min(k_max + 1, num_crops + 1))
+    inertias = []
+    models = []
+    
+    for k in k_range:
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        kmeans.fit(feature_matrix_scaled)
+        inertias.append(kmeans.inertia_)
+        models.append(kmeans)
+    
+    # Select optimal K using elbow method
+    optimal_k_idx = _auto_select_k_elbow(list(k_range), inertias)
+    optimal_k = list(k_range)[optimal_k_idx]
+    optimal_model = models[optimal_k_idx]
+    
+    cluster_labels = optimal_model.labels_.tolist()
+    
+    # Build clustering info
+    inertias_per_k = {str(k): inertia for k, inertia in zip(k_range, inertias)}
+    cluster_distribution = {}
+    for label in cluster_labels:
+        cluster_distribution[str(label)] = cluster_distribution.get(str(label), 0) + 1
+    
+    clustering_info = {
+        "optimal_k": optimal_k,
+        "inertias_per_k": inertias_per_k,
+        "cluster_distribution": cluster_distribution,
+    }
+    
+    # Generate debug plots if requested
+    if debug_plots and output_dir and frame_key:
+        frame_dir = output_dir / frame_key
+        frame_dir.mkdir(parents=True, exist_ok=True)
         
-        # Generate visualizations if requested (save in frame directory)
-        if debug_plots and frame_dir:
-            _visualize_clusters(
-                feature_matrix_scaled,
-                cluster_labels,
-                optimal_k,
-                frame_dir
-            )
-            _visualize_elbow(
-                list(k_range),
-                inertias,
-                optimal_k,
-                frame_dir
-            )
+        # Save elbow plot
+        _visualize_elbow(list(k_range), inertias, optimal_k, frame_dir)
         
-        # Save centroids in frame directory
-        if frame_dir:
-            centroids_path = frame_dir / "cluster_centroids.npy"
-            np.save(str(centroids_path), optimal_model.cluster_centers_)
-    
-    print(f"\nClustering complete. Results added to metadata.")
-    
-    return metadata
-
-
-def _extract_feature_matrix(frame_data: dict[str, Any]) -> tuple[np.ndarray, list[int]]:
-    """Extract HSV histogram feature matrix from frame crops.
-    
-    Args:
-        frame_data: Frame metadata dict containing crops with hsv_hist
+        # Save PCA visualization
+        _visualize_clusters(
+            feature_matrix_scaled,
+            np.array(cluster_labels),
+            optimal_k,
+            frame_dir,
+        )
         
-    Returns:
-        Tuple of (feature_matrix, crop_indices) where:
-            - feature_matrix: (num_crops, num_features) array
-            - crop_indices: List of crop indices that have valid histograms
-    """
-    features = []
-    indices = []
+        # Save cluster centroids
+        centroids_path = frame_dir / "cluster_centroids.npy"
+        np.save(str(centroids_path), optimal_model.cluster_centers_)
     
-    for i, crop in enumerate(frame_data["crops"]):
-        if "hsv_hist" in crop and crop["hsv_hist"]:
-            features.append(crop["hsv_hist"])
-            indices.append(i)
-    
-    return np.array(features), indices
+    return cluster_labels, clustering_info
 
 
 def _auto_select_k_elbow(k_values: list[int], inertias: list[float]) -> int:

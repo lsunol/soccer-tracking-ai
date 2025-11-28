@@ -28,7 +28,7 @@ def main():
     for idx, result in enumerate(run_yolo_on_video(
         input_path=input_video,
         output_dir=str(output_dir),
-        frames=list(range(1, 25)),
+        frames=list(range(200, 220)),
         device=device,
         debug=True,
         clustering_k_min=2,
