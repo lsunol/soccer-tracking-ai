@@ -13,11 +13,6 @@ import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
-try:
-    import umap
-    UMAP_AVAILABLE = True
-except ImportError:
-    UMAP_AVAILABLE = False
 
 
 def run_hsv_clustering(
@@ -220,60 +215,37 @@ def _visualize_clusters(
     pca = PCA(n_components=2, random_state=42)
     coords_pca = pca.fit_transform(feature_matrix)
     
+    # Create discrete colormap with exactly K colors (colorblind-friendly)
+    colors = plt.cm.tab10.colors[:k]
+    cmap_discrete = matplotlib.colors.ListedColormap(colors)
+    
     fig, ax = plt.subplots(figsize=(10, 8))
     scatter = ax.scatter(
         coords_pca[:, 0],
         coords_pca[:, 1],
         c=cluster_labels,
-        cmap='tab10',
+        cmap=cmap_discrete,
         s=100,
         alpha=0.7,
         edgecolors='black',
-        linewidth=0.5
+        linewidth=0.5,
+        vmin=-0.5,
+        vmax=k - 0.5
     )
     ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)', fontsize=11)
     ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)', fontsize=11)
     ax.set_title(f'PCA Projection (K={k} clusters)', fontsize=13, fontweight='bold')
     ax.grid(alpha=0.3)
     
-    # Add colorbar
-    cbar = plt.colorbar(scatter, ax=ax)
+    # Add discrete colorbar with exactly K colors
+    cbar = plt.colorbar(scatter, ax=ax, ticks=range(k), boundaries=np.arange(-0.5, k, 1))
     cbar.set_label('Cluster ID', fontsize=11)
+    cbar.ax.set_yticklabels([str(i) for i in range(k)])
     
     plt.tight_layout()
     pca_path = output_dir / "clusters_pca.png"
     plt.savefig(str(pca_path), dpi=150, bbox_inches='tight')
     plt.close(fig)
-    
-    # UMAP projection (2D) if available
-    if UMAP_AVAILABLE:
-        reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=min(15, len(feature_matrix) - 1))
-        coords_umap = reducer.fit_transform(feature_matrix)
-        
-        fig, ax = plt.subplots(figsize=(10, 8))
-        scatter = ax.scatter(
-            coords_umap[:, 0],
-            coords_umap[:, 1],
-            c=cluster_labels,
-            cmap='tab10',
-            s=100,
-            alpha=0.7,
-            edgecolors='black',
-            linewidth=0.5
-        )
-        ax.set_xlabel('UMAP 1', fontsize=11)
-        ax.set_ylabel('UMAP 2', fontsize=11)
-        ax.set_title(f'UMAP Projection (K={k} clusters)', fontsize=13, fontweight='bold')
-        ax.grid(alpha=0.3)
-        
-        # Add colorbar
-        cbar = plt.colorbar(scatter, ax=ax)
-        cbar.set_label('Cluster ID', fontsize=11)
-        
-        plt.tight_layout()
-        umap_path = output_dir / "clusters_umap.png"
-        plt.savefig(str(umap_path), dpi=150, bbox_inches='tight')
-        plt.close(fig)
 
 
 def _visualize_elbow(
