@@ -8,6 +8,31 @@ Minimal scaffolding to run a pretrained YOLO model on every frame of a video, de
 uv pip install -e .
 ```
 
+## Debugging
+
+To debug the project in VS Code:
+
+1. Start the debug server:
+```bash
+uv run python -m debugpy --listen 5678 --wait-for-client .\main.py
+```
+
+2. Add this configuration to your `.vscode/launch.json`:
+```json
+{
+  "name": "Python Debugger: Attach to uv debugpy",
+  "type": "debugpy",
+  "request": "attach",
+  "connect": {
+    "host": "localhost",
+    "port": 5678
+  },
+  "justMyCode": true
+}
+```
+
+3. Set breakpoints and attach the debugger using "Python Debugger: Attach to uv debugpy" from the Run and Debug panel.
+
 ## Usage
 
 ```python

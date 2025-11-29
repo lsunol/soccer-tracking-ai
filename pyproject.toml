@@ -16,3 +16,8 @@ dependencies = [
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "debugpy>=1.8.17",
+]

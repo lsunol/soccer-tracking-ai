@@ -19,3 +19,4 @@ data/
 __pycache__/
 
 *.pyc
+.vscode/launch.json
