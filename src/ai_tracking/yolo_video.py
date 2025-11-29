@@ -150,8 +150,11 @@ def _save_histogram_visualization(
         ax_hist.axvline(bin_boundary - 0.5, color='white', linewidth=2, linestyle='--', alpha=0.7)
         ax_color.axvline(bin_boundary, color='white', linewidth=2, linestyle='--', alpha=0.7)
     
-    # Save figure
-    plt.tight_layout()
+    # Save figure (suppress tight_layout warning for colorbar axis)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='This figure includes Axes that are not compatible with tight_layout')
+        plt.tight_layout()
     plt.savefig(str(output_path), dpi=100, bbox_inches='tight')
     plt.close(fig)
 
@@ -249,7 +252,8 @@ class YoloVideoRunner:
                     frame_idx += 1
                     continue
 
-                results = self.model(frame, verbose=False, **self.yolo_kwargs)
+                # Use tracking mode to get persistent track IDs across frames
+                results = self.model.track(frame, persist=True, verbose=False, **self.yolo_kwargs)
                 # YOLO returns a list of Results even for a single frame.
                 for result in results:
                     # Save YOLO annotated frame in debug mode
@@ -435,6 +439,7 @@ class YoloVideoRunner:
         for crop_meta in crops_data:
             bbox = crop_meta["bbox"]
             cluster_id = crop_meta.get("cluster_id", 0)
+            track_id = crop_meta.get("track_id")
             
             x1, y1, x2, y2 = bbox
             color = cluster_colors_bgr[cluster_id]
@@ -442,8 +447,8 @@ class YoloVideoRunner:
             # Draw rectangle with cluster color (thickness 2)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             
-            # Draw cluster ID label
-            label = f"C{cluster_id}"
+            # Draw track ID label (or cluster ID if track not available)
+            label = f"{track_id}" if track_id is not None else f"C{cluster_id}"
             label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             cv2.rectangle(
                 frame,
@@ -496,6 +501,11 @@ def extract_person_crops_from_frame(
         conf = float(boxes.conf[idx].cpu().item() if hasattr(boxes.conf[idx], "cpu") else boxes.conf[idx])
         class_name = results.names.get(cls_id, "unknown")
         
+        # Extract track ID if available (from tracking mode)
+        track_id = None
+        if hasattr(boxes, 'id') and boxes.id is not None and len(boxes.id) > idx:
+            track_id = int(boxes.id[idx].cpu().item() if hasattr(boxes.id[idx], "cpu") else boxes.id[idx])
+        
         # Only process person detections (class 0)
         if cls_id != 0:
             continue
@@ -508,6 +518,7 @@ def extract_person_crops_from_frame(
             "class_id": cls_id,
             "class_name": class_name,
             "confidence": conf,
+            "track_id": track_id,
         }
         
         crops_with_meta.append((crop, metadata))
