@@ -175,6 +175,7 @@ class YoloVideoRunner:
         clustering_k_max: int = 5,
         torso_height_ratio: float = 0.4,
         torso_width_ratio: float = 0.6,
+        history_window_size: int = 24,
     ) -> None:
         self.model_source = model_source
         self.device = device
@@ -186,7 +187,14 @@ class YoloVideoRunner:
         self.clustering_k_max = clustering_k_max
         self.torso_height_ratio = torso_height_ratio
         self.torso_width_ratio = torso_width_ratio
+        self.history_window_size = history_window_size
         self._model: Optional[YOLO] = None
+        self._frame_history: list[dict[str, Any]] = []  # Circular buffer for last N frames
+        
+        # Team tracking state for persistent team identification across frames
+        self._team_colors_bgr = self._get_colorblind_safe_palette()
+        self._next_team_id = 0  # Counter for assigning new team IDs
+        self._team_assignments: dict[int, int] = {}  # track_id -> team_id mapping
 
     @property
     def model(self) -> YOLO:
@@ -322,6 +330,12 @@ class YoloVideoRunner:
                     for i, label in enumerate(cluster_labels):
                         frame_crops[i]["cluster_id"] = label
                     
+                    # Assign persistent team IDs based on tracking history
+                    self._assign_team_ids(frame_crops)
+                    
+                    # Update frame history circular buffer
+                    self._update_frame_history(frame_idx, frame_crops)
+                    
                     # Generate and write output frame with cluster colors
                     output_frame = None
                     if output_writer is not None:
@@ -364,6 +378,10 @@ class YoloVideoRunner:
                 output_writer.release()
                 if self.output_dir:
                     print(f"\nOutput video saved to: {self.output_dir / 'output-video.mp4'}")
+
+            # Save frame history to disk (debug only)
+            if self.debug and self.output_dir:
+                self._save_frame_history()
 
             # Save metadata JSON in debug mode
             if self.debug and self.output_dir and frames_metadata:
@@ -416,39 +434,32 @@ class YoloVideoRunner:
         crops_data: list[dict[str, Any]],
         max_k: int,
     ) -> np.ndarray:
-        """Draw cluster-colored bounding boxes on frame.
+        """Draw team-colored bounding boxes on frame.
         
         Args:
             frame: Original frame to draw on
-            crops_data: List of crop metadata with bbox and cluster_id
-            max_k: Maximum number of clusters (for color selection)
+            crops_data: List of crop metadata with bbox, team_id, and track_id
+            max_k: Maximum number of clusters (unused, kept for compatibility)
             
         Returns:
-            Frame with drawn bounding boxes
+            Frame with drawn bounding boxes colored by team_id
         """
-        import matplotlib.pyplot as plt
-        
-        # Get cluster colors from tab10 colormap (same as PCA visualization)
-        cluster_colors_rgb = plt.cm.tab10.colors[:max_k]
-        cluster_colors_bgr = [
-            (int(rgb[2] * 255), int(rgb[1] * 255), int(rgb[0] * 255))
-            for rgb in cluster_colors_rgb
-        ]
-        
-        # Draw cluster-colored rectangles
+        # Draw team-colored rectangles
         for crop_meta in crops_data:
             bbox = crop_meta["bbox"]
-            cluster_id = crop_meta.get("cluster_id", 0)
+            team_id = crop_meta.get("team_id", 0)
             track_id = crop_meta.get("track_id")
             
             x1, y1, x2, y2 = bbox
-            color = cluster_colors_bgr[cluster_id]
             
-            # Draw rectangle with cluster color (thickness 2)
+            # Use colorblind-safe palette based on team_id
+            color = self._team_colors_bgr[team_id % len(self._team_colors_bgr)]
+            
+            # Draw rectangle with team color (thickness 2)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             
-            # Draw track ID label (or cluster ID if track not available)
-            label = f"{track_id}" if track_id is not None else f"C{cluster_id}"
+            # Draw track ID label (or team ID if track not available)
+            label = f"{track_id}" if track_id is not None else f"T{team_id}"
             label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             cv2.rectangle(
                 frame,
@@ -468,6 +479,209 @@ class YoloVideoRunner:
             )
         
         return frame
+
+    def _get_colorblind_safe_palette(self) -> list[tuple[int, int, int]]:
+        """Get colorblind-safe palette for team identification (BGR format).
+        
+        Returns 5 distinct colors optimized for deuteranopia/protanopia:
+        - Blue, Orange, Yellow, Purple, Pink
+        
+        Returns:
+            List of 5 BGR color tuples
+        """
+        # Colors chosen for maximum distinction with colorblindness
+        colors_rgb = [
+            (0, 114, 178),    # Blue
+            (230, 159, 0),    # Orange  
+            (240, 228, 66),   # Yellow
+            (204, 121, 167),  # Pink/Magenta
+            (0, 158, 115),    # Teal/Green
+        ]
+        # Convert RGB to BGR for OpenCV
+        return [(rgb[2], rgb[1], rgb[0]) for rgb in colors_rgb]
+    
+    def _assign_team_ids(self, crops: list[dict[str, Any]]) -> None:
+        """Assign persistent team_id to each crop based on tracking history.
+        
+        Logic:
+        - First frame: cluster_id → team_id (1:1 mapping)
+        - Subsequent frames: voting across last 7 frames (70% consensus)
+        - New track_ids: inherit team_id from cluster's dominant team
+        
+        Modifies crops in-place by adding 'team_id' field.
+        
+        Args:
+            crops: List of crop dicts with track_id and cluster_id
+        """
+        if len(self._frame_history) == 0:
+            # First frame: direct mapping cluster_id → team_id
+            for crop in crops:
+                cluster_id = crop.get("cluster_id", 0)
+                track_id = crop.get("track_id")
+                
+                # Assign team_id same as cluster_id for initialization
+                crop["team_id"] = cluster_id
+                
+                # Store mapping if we have track_id
+                if track_id is not None:
+                    self._team_assignments[track_id] = cluster_id
+                    self._next_team_id = max(self._next_team_id, cluster_id + 1)
+        else:
+            # Subsequent frames: use voting logic
+            for crop in crops:
+                track_id = crop.get("track_id")
+                cluster_id = crop.get("cluster_id", 0)
+                
+                if track_id is None:
+                    # No tracking info, fallback to cluster_id
+                    crop["team_id"] = cluster_id
+                    continue
+                
+                # Check if this track_id has history
+                if track_id in self._team_assignments:
+                    # Vote based on last 7 frames
+                    team_id = self._vote_team_id(track_id, cluster_id)
+                    crop["team_id"] = team_id
+                    self._team_assignments[track_id] = team_id
+                else:
+                    # New track_id: inherit from cluster's dominant team
+                    team_id = self._get_cluster_dominant_team(cluster_id, crops)
+                    crop["team_id"] = team_id
+                    self._team_assignments[track_id] = team_id
+    
+    def _vote_team_id(self, track_id: int, current_cluster_id: int) -> int:
+        """Vote for team_id based on track_id history in recent frames.
+        
+        Args:
+            track_id: YOLO tracking ID
+            current_cluster_id: Current frame's cluster assignment
+            
+        Returns:
+            team_id with >70% consensus, or current assignment if no consensus
+        """
+        # Look at last 7 frames for voting
+        voting_window = min(7, len(self._frame_history))
+        recent_frames = self._frame_history[-voting_window:]
+        
+        # Count team_id occurrences for this track_id
+        team_votes: dict[int, int] = {}
+        total_appearances = 0
+        
+        for frame_data in recent_frames:
+            for crop_data in frame_data["crops"]:
+                if crop_data.get("track_id") == track_id and "team_id" in crop_data:
+                    team_id = crop_data["team_id"]
+                    team_votes[team_id] = team_votes.get(team_id, 0) + 1
+                    total_appearances += 1
+        
+        if total_appearances == 0:
+            # No history, use current cluster as team
+            return current_cluster_id
+        
+        # Find team with most votes
+        winning_team = max(team_votes.items(), key=lambda x: x[1])
+        consensus_ratio = winning_team[1] / total_appearances
+        
+        # Require 70% consensus to maintain team_id
+        if consensus_ratio >= 0.70:
+            return winning_team[0]
+        else:
+            # Not enough consensus, check if cluster suggests sustained change
+            # Count recent cluster_id for this track_id
+            cluster_votes: dict[int, int] = {}
+            for frame_data in recent_frames[-5:]:  # Last 5 frames
+                for crop_data in frame_data["crops"]:
+                    if crop_data.get("track_id") == track_id:
+                        c_id = crop_data.get("cluster_id", 0)
+                        cluster_votes[c_id] = cluster_votes.get(c_id, 0) + 1
+            
+            # If current cluster is dominant in last 5 frames, consider change
+            if cluster_votes.get(current_cluster_id, 0) >= 4:
+                # Sustained change detected, assign new team_id
+                return current_cluster_id
+            else:
+                # Keep current assignment
+                return self._team_assignments.get(track_id, current_cluster_id)
+    
+    def _get_cluster_dominant_team(self, cluster_id: int, current_crops: list[dict[str, Any]]) -> int:
+        """Find dominant team_id among crops in the same cluster.
+        
+        For new track_ids, inherit team from their cluster's existing members.
+        
+        Args:
+            cluster_id: Cluster ID to analyze
+            current_crops: Current frame's crops being processed
+            
+        Returns:
+            Dominant team_id for this cluster, or cluster_id as fallback
+        """
+        # Look at current frame's crops with same cluster
+        team_counts: dict[int, int] = {}
+        
+        for crop in current_crops:
+            if crop.get("cluster_id") == cluster_id and "team_id" in crop:
+                team_id = crop["team_id"]
+                team_counts[team_id] = team_counts.get(team_id, 0) + 1
+        
+        if team_counts:
+            return max(team_counts.items(), key=lambda x: x[1])[0]
+        
+        # No existing team in this cluster, assign new team_id
+        new_team_id = self._next_team_id
+        self._next_team_id += 1
+        return new_team_id
+
+    def _update_frame_history(self, frame_idx: int, crops: list[dict[str, Any]]) -> None:
+        """Update circular buffer with current frame's crop data.
+        
+        Maintains a FIFO buffer of the last N frames, each containing:
+        - frame_idx: Frame number
+        - crops: List of dicts with bbox, track_id, cluster_id, and team_id
+        
+        Args:
+            frame_idx: Current frame index
+            crops: List of crop metadata (must include bbox, track_id, cluster_id, team_id)
+        """
+        # Extract only the essential fields for history
+        simplified_crops = []
+        for crop in crops:
+            simplified_crops.append({
+                "bbox": crop["bbox"],
+                "track_id": crop.get("track_id"),
+                "cluster_id": crop.get("cluster_id", 0),
+                "team_id": crop.get("team_id", 0),
+            })
+        
+        # Add current frame to history
+        self._frame_history.append({
+            "frame_idx": frame_idx,
+            "crops": simplified_crops,
+        })
+        
+        # Remove oldest frame if we exceed the window size (FIFO)
+        if len(self._frame_history) > self.history_window_size:
+            self._frame_history.pop(0)
+    
+    def _save_frame_history(self) -> None:
+        """Save the circular buffer to disk for debugging purposes.
+        
+        Writes a JSON file named 'temporal_frame_history.json' containing
+        the last N frames stored in the circular buffer.
+        """
+        if not self.output_dir:
+            return
+        
+        history_path = self.output_dir / "temporal_frame_history.json"
+        history_data = {
+            "window_size": self.history_window_size,
+            "frames_in_buffer": len(self._frame_history),
+            "history": self._frame_history,
+        }
+        
+        with open(history_path, "w", encoding="utf-8") as f:
+            json.dump(history_data, f, indent=2)
+        
+        print(f"Frame history saved to: {history_path}")
 
 
 def extract_person_crops_from_frame(
