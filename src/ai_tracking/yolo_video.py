@@ -21,54 +21,86 @@ def compute_hsv_histogram(
     v_bins: int = 4,
     torso_height_ratio: float = 0.4,
     torso_width_ratio: float = 0.6,
-) -> list[float]:
-    """Calculate normalized HSV histogram from a central torso region of a person crop.
+    hsv_strategy: str = "crop_torso",
+    green_h_range: tuple[int, int] = (35, 85),
+    green_s_min: int = 30,
+    green_v_min: int = 30,
+) -> tuple[list[float], Optional[np.ndarray]]:
+    """Calculate normalized HSV histogram from a person crop.
     
-    Extracts a centered rectangular region representing the player's shirt/jersey to minimize
-    grass contamination from wide leg stances or background elements.
+    Supports two strategies:
+    - "crop_torso": Extract centered torso region to minimize grass (default)
+    - "mask_green": Mask out green pixels (grass) before computing histogram
     
     Args:
         crop: BGR image as numpy array (from OpenCV)
         h_bins: Number of bins for Hue channel (0-180 in OpenCV)
         s_bins: Number of bins for Saturation channel (0-255)
         v_bins: Number of bins for Value channel (0-255)
-        torso_height_ratio: Proportion of crop height for torso region (0.4 = central 40%)
-        torso_width_ratio: Proportion of crop width for torso region (0.6 = central 60%)
+        torso_height_ratio: Proportion of crop height for torso region
+        torso_width_ratio: Proportion of crop width for torso region
+        hsv_strategy: "crop_torso" or "mask_green"
+        green_h_range: Hue range for green grass (H ∈ [min, max])
+        green_s_min: Minimum saturation for green detection
+        green_v_min: Minimum value for green detection
         
     Returns:
-        Normalized histogram as 1D list of floats (length = h_bins * s_bins * v_bins)
+        Tuple of (histogram as 1D list, transparency mask as BGRA crop or None)
     """
     if crop.size == 0:
         # Return zero vector for empty crops
-        return [0.0] * (h_bins * s_bins * v_bins)
+        return [0.0] * (h_bins * s_bins * v_bins), None
     
     # Calculate torso region dimensions
     height, width = crop.shape[:2]
     
-    torso_height = int(height * torso_height_ratio)
-    torso_width = int(width * torso_width_ratio)
-    
-    # Ensure minimum dimensions
-    if torso_height == 0:
-        torso_height = 1
-    if torso_width == 0:
-        torso_width = 1
-    
-    # Center the torso region
-    y_start = (height - torso_height) // 2
-    x_start = (width - torso_width) // 2
-    
-    # Extract centered torso region
-    torso_region = crop[y_start:y_start + torso_height, x_start:x_start + torso_width]
+    # Select region based on strategy
+    if hsv_strategy == "crop_torso":
+        # Extract centered torso region (spatial cropping)
+        torso_height = int(height * torso_height_ratio)
+        torso_width = int(width * torso_width_ratio)
+        
+        # Ensure minimum dimensions
+        if torso_height == 0:
+            torso_height = 1
+        if torso_width == 0:
+            torso_width = 1
+        
+        # Center the torso region
+        y_start = (height - torso_height) // 2
+        x_start = (width - torso_width) // 2
+        
+        # Extract centered torso region
+        region = crop[y_start:y_start + torso_height, x_start:x_start + torso_width]
+    else:
+        # Use full crop for mask_green strategy (masking instead of spatial cropping)
+        region = crop
     
     # Convert to HSV
-    hsv = cv2.cvtColor(torso_region, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
     
-    # Calculate 3D histogram
+    mask = None
+    crop_with_alpha = None
+    
+    if hsv_strategy == "mask_green":
+        # Create mask to exclude green pixels (grass)
+        lower_green = np.array([green_h_range[0], green_s_min, green_v_min])
+        upper_green = np.array([green_h_range[1], 255, 255])
+        green_mask = cv2.inRange(hsv, lower_green, upper_green)
+        
+        # Invert mask: 255 = keep (non-green), 0 = exclude (green)
+        mask = cv2.bitwise_not(green_mask)
+        
+        # Create BGRA version with transparency for saved crop
+        alpha_channel = mask.copy()
+        crop_with_alpha = cv2.cvtColor(region, cv2.COLOR_BGR2BGRA)
+        crop_with_alpha[:, :, 3] = alpha_channel
+    
+    # Calculate 3D histogram (with or without mask)
     hist = cv2.calcHist(
         [hsv],
         [0, 1, 2],  # H, S, V channels
-        None,
+        mask,  # None for crop_torso, mask for mask_green
         [h_bins, s_bins, v_bins],
         [0, 180, 0, 256, 0, 256]  # H range: 0-180, S/V range: 0-256
     )
@@ -77,7 +109,7 @@ def compute_hsv_histogram(
     cv2.normalize(hist, hist)
     
     # Flatten to 1D list
-    return hist.flatten().tolist()
+    return hist.flatten().tolist(), crop_with_alpha
 
 
 def _save_histogram_visualization(
@@ -176,6 +208,7 @@ class YoloVideoRunner:
         torso_height_ratio: float = 0.4,
         torso_width_ratio: float = 0.6,
         history_window_size: int = 24,
+        hsv_strategy: str = "crop_torso",
     ) -> None:
         self.model_source = model_source
         self.device = device
@@ -188,6 +221,7 @@ class YoloVideoRunner:
         self.torso_height_ratio = torso_height_ratio
         self.torso_width_ratio = torso_width_ratio
         self.history_window_size = history_window_size
+        self.hsv_strategy = hsv_strategy
         self._model: Optional[YOLO] = None
         self._frame_history: list[dict[str, Any]] = []  # Circular buffer for last N frames
         
@@ -289,7 +323,7 @@ class YoloVideoRunner:
                     
                     # Process each crop and compute histograms
                     for crop_idx, (crop, meta) in enumerate(crops_with_meta, start=1):
-                        crop_filename = f"crop_{crop_idx:04d}.jpg"
+                        crop_filename = f"crop_original_{crop_idx:03d}.jpg"
                         
                         # Save crop image to disk if debug mode
                         if self.debug and frame_dir:
@@ -297,13 +331,28 @@ class YoloVideoRunner:
                             cv2.imwrite(str(crop_path), crop)
                         
                         # Always compute HSV histogram for clustering
-                        hsv_hist = compute_hsv_histogram(
+                        hsv_hist, crop_with_alpha = compute_hsv_histogram(
                             crop,
                             torso_height_ratio=self.torso_height_ratio,
                             torso_width_ratio=self.torso_width_ratio,
+                            hsv_strategy=self.hsv_strategy,
                         )
                         meta["hsv_hist"] = hsv_hist
+                        
+                        # Determine file extension based on strategy
+                        crop_ext = ".png" if self.hsv_strategy == "mask_green" else ".jpg"
+                        crop_filename = f"crop_{crop_idx:03d}{crop_ext}"
                         meta["filename"] = crop_filename
+                        
+                        # Save crop image to disk if debug mode
+                        if self.debug and frame_dir:
+                            crop_path = frame_dir / crop_filename
+                            if crop_with_alpha is not None:
+                                # Save PNG with transparency
+                                cv2.imwrite(str(crop_path), crop_with_alpha)
+                            else:
+                                # Save regular JPG
+                                cv2.imwrite(str(crop_path), crop)
                         
                         # Save histogram visualization in debug mode
                         if self.debug and frame_dir:
@@ -773,6 +822,7 @@ def run_yolo_on_video(
     debug: bool = False,
     clustering_k_min: int = 2,
     clustering_k_max: int = 5,
+    hsv_strategy: str = "crop_torso",
 ) -> Iterator[Any]:
     """Process video with YOLO detection and team clustering, generating labeled output video.
     
@@ -787,6 +837,7 @@ def run_yolo_on_video(
         debug: If True, save crops, histograms, clustering plots, yolo-video.mp4, and metadata to disk
         clustering_k_min: Minimum number of clusters to try (default: 2)
         clustering_k_max: Maximum number of clusters to try (default: 5)
+        hsv_strategy: HSV histogram strategy - "crop_torso" or "mask_green" (default: "crop_torso")
     """
     output_dir_path = Path(output_dir)
 
@@ -799,6 +850,7 @@ def run_yolo_on_video(
         output_dir=output_dir_path,
         clustering_k_min=clustering_k_min,
         clustering_k_max=clustering_k_max,
+        hsv_strategy=hsv_strategy,
     )
     yield from runner.run(input_path, frames=frames)
 
