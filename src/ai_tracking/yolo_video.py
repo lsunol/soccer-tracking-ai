@@ -346,11 +346,32 @@ class YoloVideoRunner:
                         )
                         output_writer.write(output_frame)
                         
-                        # Save clustered frame in debug mode
+                        # Save clustered frame in debug mode (optimal K without suffix)
                         if self.debug and frame_dir:
                             clustered_filename = f"frame_{frame_idx:04d}_clustered.jpg"
                             clustered_path = frame_dir / clustered_filename
                             cv2.imwrite(str(clustered_path), output_frame)
+                            
+                            # Save clustered frames for all K values
+                            if "all_k_labels" in clustering_info:
+                                for k_value, k_labels in clustering_info["all_k_labels"].items():
+                                    # Temporarily assign cluster_id and team_id for this K
+                                    # Use direct mapping (team_id = cluster_id) for debug visualization
+                                    temp_crops = []
+                                    for i, crop in enumerate(frame_crops):
+                                        temp_crop = crop.copy()
+                                        temp_crop["cluster_id"] = k_labels[i]
+                                        temp_crop["team_id"] = k_labels[i]  # Direct mapping for debug
+                                        temp_crops.append(temp_crop)
+                                    
+                                    # Generate frame with this K's clustering
+                                    k_frame = self._draw_cluster_boxes(
+                                        frame.copy(),
+                                        temp_crops,
+                                        k_value
+                                    )
+                                    k_clustered_path = frame_dir / f"frame_{frame_idx:04d}_clustered_k{k_value}.jpg"
+                                    cv2.imwrite(str(k_clustered_path), k_frame)
                     
                     # Store frame metadata (optional, for debug JSON)
                     if self.debug:
@@ -456,11 +477,11 @@ class YoloVideoRunner:
             color = self._team_colors_bgr[team_id % len(self._team_colors_bgr)]
             
             # Draw rectangle with team color (thickness 2)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
             
             # Draw track ID label (or team ID if track not available)
             label = f"{track_id}" if track_id is not None else f"T{team_id}"
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
             cv2.rectangle(
                 frame,
                 (x1, y1 - label_size[1] - 8),

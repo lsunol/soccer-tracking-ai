@@ -83,10 +83,16 @@ def cluster_single_frame(
     for label in cluster_labels:
         cluster_distribution[str(label)] = cluster_distribution.get(str(label), 0) + 1
     
+    # Store all K models for debug visualization
+    all_k_labels = {}
+    for k, model in zip(k_range, models):
+        all_k_labels[k] = model.labels_.tolist()
+    
     clustering_info = {
         "optimal_k": optimal_k,
         "inertias_per_k": inertias_per_k,
         "cluster_distribution": cluster_distribution,
+        "all_k_labels": all_k_labels,  # For debug: labels for each K value
     }
     
     # Generate debug plots if requested
@@ -97,17 +103,24 @@ def cluster_single_frame(
         # Save elbow plot
         _visualize_elbow(list(k_range), inertias, optimal_k, frame_dir)
         
-        # Save PCA visualization
+        # Save PCA visualization for optimal K (without suffix, used for video)
         _visualize_clusters(
             feature_matrix_scaled,
             np.array(cluster_labels),
             optimal_k,
             frame_dir,
+            suffix=""
         )
         
-        # Save cluster centroids
-        centroids_path = frame_dir / "cluster_centroids.npy"
-        np.save(str(centroids_path), optimal_model.cluster_centers_)
+        # Save PCA visualizations for all K values
+        for k_idx, (k, model) in enumerate(zip(k_range, models)):
+            _visualize_clusters(
+                feature_matrix_scaled,
+                model.labels_,
+                k,
+                frame_dir,
+                suffix=f"_k{k}"
+            )
     
     return cluster_labels, clustering_info
 
@@ -162,14 +175,16 @@ def _visualize_clusters(
     cluster_labels: np.ndarray,
     k: int,
     output_dir: Path,
+    suffix: str = "",
 ) -> None:
-    """Generate PCA and UMAP visualizations of clusters.
+    """Generate PCA visualization of clusters.
     
     Args:
         feature_matrix: Scaled feature matrix (num_crops, num_features)
         cluster_labels: Cluster assignments for each crop
         k: Number of clusters
         output_dir: Frame directory to save visualizations
+        suffix: Optional suffix for filename (e.g., "_k2", "_k3")
     """
     # PCA projection (2D)
     pca = PCA(n_components=2, random_state=42)
@@ -192,6 +207,20 @@ def _visualize_clusters(
         vmin=-0.5,
         vmax=k - 0.5
     )
+    
+    # Annotate each point with its crop number (1-indexed)
+    for i, (x, y) in enumerate(coords_pca):
+        ax.annotate(
+            str(i + 1),  # Crop number (1-indexed)
+            (x, y),
+            xytext=(5, 5),  # Offset from point
+            textcoords='offset points',
+            fontsize=8,
+            fontweight='bold',
+            color='black',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='none', alpha=0.15)
+        )
+    
     ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)', fontsize=11)
     ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)', fontsize=11)
     ax.set_title(f'PCA Projection (K={k} clusters)', fontsize=13, fontweight='bold')
@@ -203,7 +232,7 @@ def _visualize_clusters(
     cbar.ax.set_yticklabels([str(i) for i in range(k)])
     
     plt.tight_layout()
-    pca_path = output_dir / "clusters_pca.png"
+    pca_path = output_dir / f"clusters_pca{suffix}.png"
     plt.savefig(str(pca_path), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
