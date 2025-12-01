@@ -17,18 +17,16 @@ from sklearn.decomposition import PCA
 
 def cluster_single_frame(
     crops_data: list[dict[str, Any]],
-    k_min: int = 2,
-    k_max: int = 5,
+    k: int = 2,
     output_dir: Optional[Path] = None,
     frame_key: Optional[str] = None,
     debug_plots: bool = False,
 ) -> tuple[list[int], dict[str, Any]]:
-    """Execute K-Means clustering on a single frame's crops.
+    """Execute K-Means clustering on a single frame's crops with K=2 (two teams).
     
     Args:
         crops_data: List of crop metadata dicts with hsv_hist field
-        k_min: Minimum number of clusters to try
-        k_max: Maximum number of clusters to try
+        k: Number of clusters (fixed at 2 for two teams)
         output_dir: Directory to save debug visualizations (frame subdir)
         frame_key: Frame identifier for debug output
         debug_plots: Whether to generate debug visualizations
@@ -42,12 +40,12 @@ def cluster_single_frame(
     if num_crops == 0:
         return [], {}
     
-    if num_crops < k_min:
-        # Assign all to cluster 0
+    if num_crops < k:
+        # Not enough crops for K clusters, assign all to cluster 0
         labels = [0] * num_crops
         info = {
-            "optimal_k": 1,
-            "inertias_per_k": {},
+            "k": 1,
+            "inertia": 0.0,
             "cluster_distribution": {"0": num_crops}
         }
         return labels, info
@@ -59,40 +57,21 @@ def cluster_single_frame(
     scaler = StandardScaler()
     feature_matrix_scaled = scaler.fit_transform(feature_matrix)
     
-    # Try different K values
-    k_range = range(k_min, min(k_max + 1, num_crops + 1))
-    inertias = []
-    models = []
+    # Run K-Means with K=2
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    kmeans.fit(feature_matrix_scaled)
     
-    for k in k_range:
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        kmeans.fit(feature_matrix_scaled)
-        inertias.append(kmeans.inertia_)
-        models.append(kmeans)
-    
-    # Select optimal K using elbow method
-    optimal_k_idx = _auto_select_k_elbow(list(k_range), inertias)
-    optimal_k = list(k_range)[optimal_k_idx]
-    optimal_model = models[optimal_k_idx]
-    
-    cluster_labels = optimal_model.labels_.tolist()
+    cluster_labels = kmeans.labels_.tolist()
     
     # Build clustering info
-    inertias_per_k = {str(k): inertia for k, inertia in zip(k_range, inertias)}
     cluster_distribution = {}
     for label in cluster_labels:
         cluster_distribution[str(label)] = cluster_distribution.get(str(label), 0) + 1
     
-    # Store all K models for debug visualization
-    all_k_labels = {}
-    for k, model in zip(k_range, models):
-        all_k_labels[k] = model.labels_.tolist()
-    
     clustering_info = {
-        "optimal_k": optimal_k,
-        "inertias_per_k": inertias_per_k,
+        "k": k,
+        "inertia": float(kmeans.inertia_),
         "cluster_distribution": cluster_distribution,
-        "all_k_labels": all_k_labels,  # For debug: labels for each K value
     }
     
     # Generate debug plots if requested
@@ -100,74 +79,15 @@ def cluster_single_frame(
         frame_dir = output_dir / frame_key
         frame_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save elbow plot
-        _visualize_elbow(list(k_range), inertias, optimal_k, frame_dir)
-        
-        # Save PCA visualization for optimal K (without suffix, used for video)
+        # Save PCA visualization
         _visualize_clusters(
             feature_matrix_scaled,
             np.array(cluster_labels),
-            optimal_k,
+            k,
             frame_dir,
-            suffix=""
         )
-        
-        # Save PCA visualizations for all K values
-        for k_idx, (k, model) in enumerate(zip(k_range, models)):
-            _visualize_clusters(
-                feature_matrix_scaled,
-                model.labels_,
-                k,
-                frame_dir,
-                suffix=f"_k{k}"
-            )
     
     return cluster_labels, clustering_info
-
-
-def _auto_select_k_elbow(k_values: list[int], inertias: list[float]) -> int:
-    """Select optimal K using elbow method heuristic.
-    
-    Strategy: Choose K where the improvement starts to plateau significantly.
-    Uses second derivative approach to find the point of maximum curvature.
-    
-    Args:
-        k_values: List of K values tested
-        inertias: List of corresponding inertia values
-        
-    Returns:
-        Index of optimal K in k_values list
-    """
-    if len(inertias) <= 1:
-        return 0
-    
-    if len(inertias) == 2:
-        return 0  # Default to smallest K if only 2 values
-    
-    # Calculate first derivative (improvements = rate of inertia reduction)
-    improvements = []
-    for i in range(1, len(inertias)):
-        improvement = inertias[i-1] - inertias[i]
-        improvements.append(improvement)
-    
-    # Calculate second derivative (rate of change of improvements)
-    if len(improvements) < 2:
-        return 0
-    
-    second_derivatives = []
-    for i in range(1, len(improvements)):
-        second_deriv = improvements[i-1] - improvements[i]
-        second_derivatives.append(second_deriv)
-    
-    # Find elbow at maximum positive second derivative
-    # (point where improvements start declining most rapidly)
-    if second_derivatives:
-        max_curv_idx = second_derivatives.index(max(second_derivatives))
-        # Add 1 because second_derivatives[i] corresponds to k_values[i+1]
-        return max_curv_idx + 1
-    
-    # Fallback to middle value
-    return len(k_values) // 2
 
 
 def _visualize_clusters(
@@ -175,7 +95,6 @@ def _visualize_clusters(
     cluster_labels: np.ndarray,
     k: int,
     output_dir: Path,
-    suffix: str = "",
 ) -> None:
     """Generate PCA visualization of clusters.
     
@@ -184,7 +103,6 @@ def _visualize_clusters(
         cluster_labels: Cluster assignments for each crop
         k: Number of clusters
         output_dir: Frame directory to save visualizations
-        suffix: Optional suffix for filename (e.g., "_k2", "_k3")
     """
     # PCA projection (2D)
     pca = PCA(n_components=2, random_state=42)
@@ -232,44 +150,6 @@ def _visualize_clusters(
     cbar.ax.set_yticklabels([str(i) for i in range(k)])
     
     plt.tight_layout()
-    pca_path = output_dir / f"clusters_pca{suffix}.png"
+    pca_path = output_dir / "clusters_pca.png"
     plt.savefig(str(pca_path), dpi=150, bbox_inches='tight')
-    plt.close(fig)
-
-
-def _visualize_elbow(
-    k_values: list[int],
-    inertias: list[float],
-    optimal_k: int,
-    output_dir: Path,
-) -> None:
-    """Generate elbow method visualization.
-    
-    Args:
-        k_values: List of K values tested
-        inertias: List of corresponding inertia values
-        optimal_k: Selected optimal K value
-        output_dir: Frame directory to save visualization
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    # Plot inertia curve
-    ax.plot(k_values, inertias, 'bo-', linewidth=2, markersize=8, label='Inertia')
-    
-    # Highlight optimal K
-    optimal_idx = k_values.index(optimal_k)
-    ax.plot(optimal_k, inertias[optimal_idx], 'ro', markersize=15, 
-            label=f'Selected K={optimal_k}', zorder=5)
-    
-    # Styling
-    ax.set_xlabel('Number of Clusters (K)', fontsize=12)
-    ax.set_ylabel('Inertia (Within-Cluster Sum of Squares)', fontsize=12)
-    ax.set_title('Elbow Method for Optimal K', fontsize=14, fontweight='bold')
-    ax.set_xticks(k_values)
-    ax.grid(alpha=0.3)
-    ax.legend(fontsize=11)
-    
-    plt.tight_layout()
-    elbow_path = output_dir / "elbow_method.png"
-    plt.savefig(str(elbow_path), dpi=150, bbox_inches='tight')
     plt.close(fig)

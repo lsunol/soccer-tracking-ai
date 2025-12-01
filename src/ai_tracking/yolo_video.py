@@ -112,6 +112,81 @@ def compute_hsv_histogram(
     return hist.flatten().tolist(), crop_with_alpha
 
 
+def _detect_referee_from_histogram(
+    hsv_hist: list[float],
+    *,
+    h_bins: int = 8,
+    s_bins: int = 4,
+    v_bins: int = 4,
+    yellow_h_range: tuple[int, int] = (20, 40),
+    yellow_s_min: float = 0.6,
+    yellow_v_min: float = 0.6,
+    dark_v_max: float = 0.3,
+    yellow_threshold: float = 0.30,
+    dark_threshold: float = 0.15,
+) -> bool:
+    """Detect if a crop corresponds to a referee based on HSV histogram.
+    
+    Referees typically have:
+    - Strong yellow in upper body (jersey): H ≈ 30 (yellow in OpenCV 0-180 scale)
+    - Dark/black in lower body (shorts): Low V values
+    
+    Args:
+        hsv_hist: Flattened HSV histogram vector
+        h_bins: Number of hue bins used in histogram
+        s_bins: Number of saturation bins used in histogram
+        v_bins: Number of value bins used in histogram
+        yellow_h_range: Hue range for yellow (H ∈ [min, max], OpenCV scale 0-180)
+        yellow_s_min: Minimum normalized saturation for yellow (0-1)
+        yellow_v_min: Minimum normalized value for yellow (0-1)
+        dark_v_max: Maximum normalized value for dark colors (0-1)
+        yellow_threshold: Minimum proportion of histogram that must be yellow (0-1)
+        dark_threshold: Minimum proportion of histogram that must be dark (0-1)
+        
+    Returns:
+        True if the crop is likely a referee, False otherwise
+    """
+    hist_array = np.array(hsv_hist)
+    total_mass = hist_array.sum()
+    
+    if total_mass == 0:
+        return False
+    
+    # Analyze each bin
+    yellow_mass = 0.0
+    dark_mass = 0.0
+    
+    for i, mass in enumerate(hist_array):
+        # Decode bin index to h, s, v coordinates
+        h_idx = i // (s_bins * v_bins)
+        remaining = i % (s_bins * v_bins)
+        s_idx = remaining // v_bins
+        v_idx = remaining % v_bins
+        
+        # Convert bin indices to normalized HSV values (0-1)
+        h_value = ((h_idx + 0.5) / h_bins) * 180  # Back to OpenCV 0-180 scale
+        s_value = (s_idx + 0.5) / s_bins
+        v_value = (v_idx + 0.5) / v_bins
+        
+        # Check if bin represents yellow
+        if (yellow_h_range[0] <= h_value <= yellow_h_range[1] and
+            s_value >= yellow_s_min and
+            v_value >= yellow_v_min):
+            yellow_mass += mass
+        
+        # Check if bin represents dark/black
+        if v_value <= dark_v_max:
+            dark_mass += mass
+    
+    # Calculate proportions
+    yellow_proportion = yellow_mass / total_mass
+    dark_proportion = dark_mass / total_mass
+    
+    # Referee detection: significant yellow AND significant dark
+    return (yellow_proportion >= yellow_threshold and 
+            dark_proportion >= dark_threshold)
+
+
 def _save_histogram_visualization(
     hsv_hist: list[float],
     output_path: Path,
@@ -203,8 +278,6 @@ class YoloVideoRunner:
         video_fourcc: str = "mp4v",
         debug: bool = False,
         output_dir: Optional[str | Path] = None,
-        clustering_k_min: int = 2,
-        clustering_k_max: int = 5,
         torso_height_ratio: float = 0.4,
         torso_width_ratio: float = 0.6,
         history_window_size: int = 24,
@@ -216,8 +289,6 @@ class YoloVideoRunner:
         self.video_fourcc = video_fourcc
         self.debug = debug
         self.output_dir = Path(output_dir) if output_dir else None
-        self.clustering_k_min = clustering_k_min
-        self.clustering_k_max = clustering_k_max
         self.torso_height_ratio = torso_height_ratio
         self.torso_width_ratio = torso_width_ratio
         self.history_window_size = history_window_size
@@ -227,7 +298,7 @@ class YoloVideoRunner:
         
         # Team tracking state for persistent team identification across frames
         self._team_colors_bgr = self._get_colorblind_safe_palette()
-        self._next_team_id = 0  # Counter for assigning new team IDs
+        self._next_team_id = 1  # Counter for assigning new team IDs (0 reserved for referees)
         self._team_assignments: dict[int, int] = {}  # track_id -> team_id mapping
 
     @property
@@ -339,6 +410,10 @@ class YoloVideoRunner:
                         )
                         meta["hsv_hist"] = hsv_hist
                         
+                        # Detect referee based on HSV histogram (yellow + black pattern)
+                        is_referee = _detect_referee_from_histogram(hsv_hist)
+                        meta["role"] = "referee" if is_referee else "player"
+                        
                         # Determine file extension based on strategy
                         crop_ext = ".png" if self.hsv_strategy == "mask_green" else ".jpg"
                         crop_filename = f"crop_{crop_idx:03d}{crop_ext}"
@@ -363,21 +438,37 @@ class YoloVideoRunner:
                         
                         frame_crops.append(meta)
                     
-                    # Perform clustering on this frame immediately
+                    # Separate referees from players before clustering
+                    player_crops = [crop for crop in frame_crops if crop.get("role") == "player"]
+                    referee_crops = [crop for crop in frame_crops if crop.get("role") == "referee"]
+                    
+                    # Perform clustering only on players
                     from .clustering import cluster_single_frame
                     
-                    cluster_labels, clustering_info = cluster_single_frame(
-                        frame_crops,
-                        k_min=self.clustering_k_min,
-                        k_max=self.clustering_k_max,
-                        output_dir=self.output_dir,
-                        frame_key=frame_key,
-                        debug_plots=self.debug,
-                    )
+                    cluster_labels = []
+                    clustering_info = {}
                     
-                    # Assign cluster IDs to crops
-                    for i, label in enumerate(cluster_labels):
-                        frame_crops[i]["cluster_id"] = label
+                    if player_crops:
+                        cluster_labels, clustering_info = cluster_single_frame(
+                            player_crops,
+                            k=2,  # Fixed K=2 for two teams
+                            output_dir=self.output_dir,
+                            frame_key=frame_key,
+                            debug_plots=self.debug,
+                        )
+                    
+                    # Assign cluster IDs to player crops
+                    player_idx = 0
+                    for crop in frame_crops:
+                        if crop.get("role") == "player":
+                            if player_idx < len(cluster_labels):
+                                crop["cluster_id"] = cluster_labels[player_idx]
+                                player_idx += 1
+                            else:
+                                crop["cluster_id"] = 0
+                        else:
+                            # Referees don't have cluster_id (will get team_id=0 later)
+                            crop["cluster_id"] = -1
                     
                     # Assign persistent team IDs based on tracking history
                     self._assign_team_ids(frame_crops)
@@ -391,36 +482,26 @@ class YoloVideoRunner:
                         output_frame = self._draw_cluster_boxes(
                             frame.copy(),
                             frame_crops,
-                            clustering_info.get("optimal_k", 1)
+                            clustering_info.get("k", 2)
                         )
                         output_writer.write(output_frame)
                         
-                        # Save clustered frame in debug mode (optimal K without suffix)
+                        # Save team_id frame in debug mode (after voting)
                         if self.debug and frame_dir:
-                            clustered_filename = f"frame_{frame_idx:04d}_clustered.jpg"
-                            clustered_path = frame_dir / clustered_filename
-                            cv2.imwrite(str(clustered_path), output_frame)
-                            
-                            # Save clustered frames for all K values
-                            if "all_k_labels" in clustering_info:
-                                for k_value, k_labels in clustering_info["all_k_labels"].items():
-                                    # Temporarily assign cluster_id and team_id for this K
-                                    # Use direct mapping (team_id = cluster_id) for debug visualization
-                                    temp_crops = []
-                                    for i, crop in enumerate(frame_crops):
-                                        temp_crop = crop.copy()
-                                        temp_crop["cluster_id"] = k_labels[i]
-                                        temp_crop["team_id"] = k_labels[i]  # Direct mapping for debug
-                                        temp_crops.append(temp_crop)
-                                    
-                                    # Generate frame with this K's clustering
-                                    k_frame = self._draw_cluster_boxes(
-                                        frame.copy(),
-                                        temp_crops,
-                                        k_value
-                                    )
-                                    k_clustered_path = frame_dir / f"frame_{frame_idx:04d}_clustered_k{k_value}.jpg"
-                                    cv2.imwrite(str(k_clustered_path), k_frame)
+                            team_id_filename = f"frame_{frame_idx:04d}_team_id.jpg"
+                            team_id_path = frame_dir / team_id_filename
+                            cv2.imwrite(str(team_id_path), output_frame)
+                        
+                        # Save cluster_id frame in debug mode (pure K-Means, before voting)
+                        if self.debug and frame_dir:
+                            cluster_frame = self._draw_cluster_boxes_kmeans(
+                                frame.copy(),
+                                frame_crops,
+                                clustering_info.get("k", 2)
+                            )
+                            cluster_id_filename = f"frame_{frame_idx:04d}_cluster_id.jpg"
+                            cluster_id_path = frame_dir / cluster_id_filename
+                            cv2.imwrite(str(cluster_id_path), cluster_frame)
                     
                     # Store frame metadata (optional, for debug JSON)
                     if self.debug:
@@ -473,6 +554,9 @@ class YoloVideoRunner:
         if not self.output_dir:
             raise ValueError("output_dir required for YOLO video")
         
+        # Ensure output directory exists
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
         output_path = self.output_dir / "yolo-video.mp4"
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
@@ -487,6 +571,9 @@ class YoloVideoRunner:
         """Build video writer for cluster-colored output video."""
         if not self.output_dir:
             raise ValueError("output_dir required for output video")
+        
+        # Ensure output directory exists
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         
         output_path = self.output_dir / "output-video.mp4"
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -519,17 +606,93 @@ class YoloVideoRunner:
             bbox = crop_meta["bbox"]
             team_id = crop_meta.get("team_id", 0)
             track_id = crop_meta.get("track_id")
+            role = crop_meta.get("role", "player")
             
             x1, y1, x2, y2 = bbox
             
-            # Use colorblind-safe palette based on team_id
-            color = self._team_colors_bgr[team_id % len(self._team_colors_bgr)]
+            # Special handling for referees: gray color
+            if role == "referee" or team_id == 0:
+                color = (128, 128, 128)  # Gray in BGR
+                label = "REF"
+            else:
+                # Use colorblind-safe palette based on team_id
+                # Offset by -1 since team_id starts at 1 for players
+                palette_idx = (team_id - 1) % len(self._team_colors_bgr)
+                color = self._team_colors_bgr[palette_idx]
+                # Draw track ID label (or team ID if track not available)
+                label = f"{track_id}" if track_id is not None else f"T{team_id}"
             
-            # Draw rectangle with team color (thickness 2)
+            # Draw rectangle with team color (thickness 1)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
             
-            # Draw track ID label (or team ID if track not available)
-            label = f"{track_id}" if track_id is not None else f"T{team_id}"
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+            cv2.rectangle(
+                frame,
+                (x1, y1 - label_size[1] - 8),
+                (x1 + label_size[0] + 4, y1),
+                color,
+                -1
+            )
+            cv2.putText(
+                frame,
+                label,
+                (x1 + 2, y1 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+            )
+        
+        return frame
+    
+    def _draw_cluster_boxes_kmeans(
+        self,
+        frame: np.ndarray,
+        crops_data: list[dict[str, Any]],
+        max_k: int,
+    ) -> np.ndarray:
+        """Draw cluster-colored bounding boxes on frame (pure K-Means, no voting).
+        
+        Uses cluster_id directly from K-Means output, marking with asterisk (*)
+        those crops whose cluster differs from their voted team_id (in transition).
+        
+        Args:
+            frame: Original frame to draw on
+            crops_data: List of crop metadata with bbox, cluster_id, team_id, and track_id
+            max_k: Maximum number of clusters (unused, kept for compatibility)
+            
+        Returns:
+            Frame with drawn bounding boxes colored by cluster_id
+        """
+        # Draw cluster-colored rectangles
+        for crop_meta in crops_data:
+            bbox = crop_meta["bbox"]
+            cluster_id = crop_meta.get("cluster_id", 0)
+            team_id = crop_meta.get("team_id", 0)
+            track_id = crop_meta.get("track_id")
+            role = crop_meta.get("role", "player")
+            
+            x1, y1, x2, y2 = bbox
+            
+            # Special handling for referees: gray color
+            if role == "referee" or cluster_id == -1:
+                color = (128, 128, 128)  # Gray in BGR
+                label = "REF"
+            else:
+                # Use colorblind-safe palette based on cluster_id
+                palette_idx = cluster_id % len(self._team_colors_bgr)
+                color = self._team_colors_bgr[palette_idx]
+                # Draw track ID label
+                label = f"{track_id}" if track_id is not None else f"C{cluster_id}"
+                
+                # Mark with asterisk if cluster_id differs from team_id (in transition)
+                # team_id is 1-indexed, so cluster_id should be team_id - 1 when stable
+                if cluster_id != team_id - 1:
+                    label += "*"
+            
+            # Draw rectangle with cluster color (thickness 1)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
+            
             label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
             cv2.rectangle(
                 frame,
@@ -574,37 +737,54 @@ class YoloVideoRunner:
         """Assign persistent team_id to each crop based on tracking history.
         
         Logic:
-        - First frame: cluster_id → team_id (1:1 mapping)
-        - Subsequent frames: voting across last 7 frames (70% consensus)
+        - Referees: Always get team_id=0 (reserved)
+        - Players, first frame: cluster_id → team_id (1:1 mapping, starting from 1)
+        - Players, subsequent frames: voting across last 7 frames (70% consensus)
         - New track_ids: inherit team_id from cluster's dominant team
         
         Modifies crops in-place by adding 'team_id' field.
         
         Args:
-            crops: List of crop dicts with track_id and cluster_id
+            crops: List of crop dicts with track_id, cluster_id, and role
         """
+        # First pass: assign team_id=0 to all referees
+        for crop in crops:
+            if crop.get("role") == "referee":
+                crop["team_id"] = 0
+                track_id = crop.get("track_id")
+                if track_id is not None:
+                    self._team_assignments[track_id] = 0
+        
+        # Second pass: assign team_ids to players
         if len(self._frame_history) == 0:
-            # First frame: direct mapping cluster_id → team_id
+            # First frame: direct mapping cluster_id → team_id (starting from 1)
             for crop in crops:
+                if crop.get("role") == "referee":
+                    continue  # Already handled
+                
                 cluster_id = crop.get("cluster_id", 0)
                 track_id = crop.get("track_id")
                 
-                # Assign team_id same as cluster_id for initialization
-                crop["team_id"] = cluster_id
+                # Assign team_id = cluster_id + 1 (to avoid team_id=0 reserved for referees)
+                team_id = cluster_id + 1
+                crop["team_id"] = team_id
                 
                 # Store mapping if we have track_id
                 if track_id is not None:
-                    self._team_assignments[track_id] = cluster_id
-                    self._next_team_id = max(self._next_team_id, cluster_id + 1)
+                    self._team_assignments[track_id] = team_id
+                    self._next_team_id = max(self._next_team_id, team_id + 1)
         else:
-            # Subsequent frames: use voting logic
+            # Subsequent frames: use voting logic for players only
             for crop in crops:
+                if crop.get("role") == "referee":
+                    continue  # Already handled
+                
                 track_id = crop.get("track_id")
                 cluster_id = crop.get("cluster_id", 0)
                 
                 if track_id is None:
-                    # No tracking info, fallback to cluster_id
-                    crop["team_id"] = cluster_id
+                    # No tracking info, fallback to cluster_id + 1
+                    crop["team_id"] = cluster_id + 1
                     continue
                 
                 # Check if this track_id has history
@@ -620,58 +800,53 @@ class YoloVideoRunner:
                     self._team_assignments[track_id] = team_id
     
     def _vote_team_id(self, track_id: int, current_cluster_id: int) -> int:
-        """Vote for team_id based on track_id history in recent frames.
+        """Vote for team_id based on REAL cluster_id history (not voted team_id).
+        
+        IMPORTANT: Votes based on the actual cluster_id from K-Means, not the
+        team_id that was assigned after voting. This ensures that if K-Means
+        consistently says a player changed teams, the change will eventually happen.
         
         Args:
             track_id: YOLO tracking ID
-            current_cluster_id: Current frame's cluster assignment
+            current_cluster_id: Current frame's cluster assignment from K-Means
             
         Returns:
-            team_id with >70% consensus, or current assignment if no consensus
+            team_id based on cluster_id consensus over last 7 frames
         """
         # Look at last 7 frames for voting
         voting_window = min(7, len(self._frame_history))
         recent_frames = self._frame_history[-voting_window:]
         
-        # Count team_id occurrences for this track_id
-        team_votes: dict[int, int] = {}
+        # Count CLUSTER_ID occurrences (real K-Means output), not team_id
+        cluster_votes: dict[int, int] = {}
         total_appearances = 0
         
         for frame_data in recent_frames:
             for crop_data in frame_data["crops"]:
-                if crop_data.get("track_id") == track_id and "team_id" in crop_data:
-                    team_id = crop_data["team_id"]
-                    team_votes[team_id] = team_votes.get(team_id, 0) + 1
-                    total_appearances += 1
+                if crop_data.get("track_id") == track_id:
+                    # Vote on REAL cluster_id from K-Means, not voted team_id
+                    cluster_id = crop_data.get("cluster_id", 0)
+                    if cluster_id >= 0:  # Exclude referees (cluster_id=-1)
+                        cluster_votes[cluster_id] = cluster_votes.get(cluster_id, 0) + 1
+                        total_appearances += 1
         
         if total_appearances == 0:
-            # No history, use current cluster as team
-            return current_cluster_id
+            # No history, use current cluster as team (offset by +1 for players)
+            return current_cluster_id + 1
         
-        # Find team with most votes
-        winning_team = max(team_votes.items(), key=lambda x: x[1])
-        consensus_ratio = winning_team[1] / total_appearances
+        # Find cluster with most votes (majority wins)
+        winning_cluster = max(cluster_votes.items(), key=lambda x: x[1])
+        consensus_ratio = winning_cluster[1] / total_appearances
         
-        # Require 70% consensus to maintain team_id
-        if consensus_ratio >= 0.70:
-            return winning_team[0]
-        else:
-            # Not enough consensus, check if cluster suggests sustained change
-            # Count recent cluster_id for this track_id
-            cluster_votes: dict[int, int] = {}
-            for frame_data in recent_frames[-5:]:  # Last 5 frames
-                for crop_data in frame_data["crops"]:
-                    if crop_data.get("track_id") == track_id:
-                        c_id = crop_data.get("cluster_id", 0)
-                        cluster_votes[c_id] = cluster_votes.get(c_id, 0) + 1
-            
-            # If current cluster is dominant in last 5 frames, consider change
-            if cluster_votes.get(current_cluster_id, 0) >= 4:
-                # Sustained change detected, assign new team_id
-                return current_cluster_id
-            else:
-                # Keep current assignment
-                return self._team_assignments.get(track_id, current_cluster_id)
+        # Simple majority rule: if winning cluster has >50%, use it
+        # This allows changes when there's clear evidence from K-Means
+        if consensus_ratio > 0.50:
+            # Majority agrees on this cluster, assign corresponding team_id
+            return winning_cluster[0] + 1
+        
+        # No clear majority, keep current assignment if available
+        current_team_id = self._team_assignments.get(track_id)
+        return current_team_id if current_team_id is not None else current_cluster_id + 1
     
     def _get_cluster_dominant_team(self, cluster_id: int, current_crops: list[dict[str, Any]]) -> int:
         """Find dominant team_id among crops in the same cluster.
@@ -685,11 +860,13 @@ class YoloVideoRunner:
         Returns:
             Dominant team_id for this cluster, or cluster_id as fallback
         """
-        # Look at current frame's crops with same cluster
+        # Look at current frame's crops with same cluster (exclude referees)
         team_counts: dict[int, int] = {}
         
         for crop in current_crops:
-            if crop.get("cluster_id") == cluster_id and "team_id" in crop:
+            if (crop.get("cluster_id") == cluster_id and 
+                "team_id" in crop and 
+                crop.get("role") == "player"):
                 team_id = crop["team_id"]
                 team_counts[team_id] = team_counts.get(team_id, 0) + 1
         
@@ -720,6 +897,7 @@ class YoloVideoRunner:
                 "track_id": crop.get("track_id"),
                 "cluster_id": crop.get("cluster_id", 0),
                 "team_id": crop.get("team_id", 0),
+                "role": crop.get("role", "player"),
             })
         
         # Add current frame to history
@@ -820,11 +998,11 @@ def run_yolo_on_video(
     yolo_kwargs: Optional[dict[str, Any]] = None,
     video_fourcc: str = "mp4v",
     debug: bool = False,
-    clustering_k_min: int = 2,
-    clustering_k_max: int = 5,
     hsv_strategy: str = "crop_torso",
 ) -> Iterator[Any]:
     """Process video with YOLO detection and team clustering, generating labeled output video.
+    
+    Uses K-Means with K=2 to identify two teams, plus automatic referee detection.
     
     Args:
         input_path: Path to input video file
@@ -835,8 +1013,6 @@ def run_yolo_on_video(
         yolo_kwargs: Additional kwargs for YOLO inference
         video_fourcc: Video codec fourcc code
         debug: If True, save crops, histograms, clustering plots, yolo-video.mp4, and metadata to disk
-        clustering_k_min: Minimum number of clusters to try (default: 2)
-        clustering_k_max: Maximum number of clusters to try (default: 5)
         hsv_strategy: HSV histogram strategy - "crop_torso" or "mask_green" (default: "crop_torso")
     """
     output_dir_path = Path(output_dir)
@@ -848,8 +1024,6 @@ def run_yolo_on_video(
         video_fourcc=video_fourcc,
         debug=debug,
         output_dir=output_dir_path,
-        clustering_k_min=clustering_k_min,
-        clustering_k_max=clustering_k_max,
         hsv_strategy=hsv_strategy,
     )
     yield from runner.run(input_path, frames=frames)

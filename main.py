@@ -38,11 +38,13 @@ def main():
     for idx, result in enumerate(run_yolo_on_video(
         input_path=input_video,
         output_dir=str(output_dir),
-        frames=list(range(200, 220)),
-        device=device,
+        # frames=[10],
+        # frames=[216],
+        frames=list(range(0, 10)),
         debug=True,
-        clustering_k_min=2,
-        clustering_k_max=5,
+        # debug=False,
+        device=device,
+        hsv_strategy="mask_green",
     )):
         frame_count = idx + 1
         num_detections = len(result.boxes) if result.boxes else 0
