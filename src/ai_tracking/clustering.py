@@ -1,118 +1,131 @@
-"""Unsupervised clustering of person crops based on HSV histogram features."""
+"""Clustering helpers for grouping players by jersey colors."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Iterable, Sequence
 
-import numpy as np
 import matplotlib
-matplotlib.use('Agg')
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+from .models import ClusterResult, ClusteringSummary, CropSample
+
+
+class TeamClusterer:
+    """K-Means based clustering component with optional debug visualizations."""
+
+    def __init__(
+        self,
+        *,
+        n_clusters: int = 2,
+        random_state: int = 42,
+        n_init: int = 10,
+    ) -> None:
+        self.n_clusters = n_clusters
+        self._kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=n_init)
+        self._scaler = StandardScaler()
+
+    def cluster(
+        self,
+        crops_data: Sequence[CropSample] | Sequence[dict[str, object]],
+        *,
+        output_dir: Path | None = None,
+        frame_key: str | None = None,
+        debug_plots: bool = False,
+    ) -> ClusterResult:
+        """Run clustering on the provided crops and optionally emit debug plots."""
+        feature_matrix = self._build_feature_matrix(crops_data)
+        num_crops = len(feature_matrix)
+
+        if num_crops == 0:
+            return ClusterResult(labels=[], summary=ClusteringSummary(k=0, inertia=0.0))
+
+        if num_crops < self.n_clusters:
+            labels = [0] * num_crops
+            summary = ClusteringSummary(k=1, inertia=0.0, cluster_distribution={"0": num_crops})
+            return ClusterResult(labels=labels, summary=summary)
+
+        feature_matrix_scaled = self._scaler.fit_transform(feature_matrix)
+        self._kmeans.fit(feature_matrix_scaled)
+        labels = self._kmeans.labels_.tolist()
+
+        distribution: dict[str, int] = {}
+        for label in labels:
+            distribution[str(label)] = distribution.get(str(label), 0) + 1
+
+        summary = ClusteringSummary(
+            k=self.n_clusters,
+            inertia=float(self._kmeans.inertia_),
+            cluster_distribution=distribution,
+        )
+
+        if debug_plots and output_dir and frame_key:
+            frame_dir = output_dir / frame_key
+            frame_dir.mkdir(parents=True, exist_ok=True)
+            _visualize_clusters(frame_dir, feature_matrix_scaled, labels, self.n_clusters)
+
+        return ClusterResult(labels=labels, summary=summary)
+
+    @staticmethod
+    def _build_feature_matrix(
+        crops_data: Sequence[CropSample] | Sequence[dict[str, object]]
+    ) -> np.ndarray:
+        """Extract HSV histograms from either CropSample objects or metadata dicts."""
+        features: list[list[float]] = []
+        for crop in crops_data:
+            if isinstance(crop, CropSample):
+                features.append(crop.hsv_hist)
+            else:
+                hist = crop.get("hsv_hist")  # type: ignore[assignment]
+                if isinstance(hist, Iterable):
+                    features.append(list(hist))
+        return np.asarray(features, dtype=np.float32)
 
 
 def cluster_single_frame(
-    crops_data: list[dict[str, Any]],
+    crops_data: Sequence[CropSample] | Sequence[dict[str, object]],
     k: int = 2,
-    output_dir: Optional[Path] = None,
-    frame_key: Optional[str] = None,
+    output_dir: Path | None = None,
+    frame_key: str | None = None,
     debug_plots: bool = False,
-) -> tuple[list[int], dict[str, Any]]:
-    """Execute K-Means clustering on a single frame's crops with K=2 (two teams).
-    
-    Args:
-        crops_data: List of crop metadata dicts with hsv_hist field
-        k: Number of clusters (fixed at 2 for two teams)
-        output_dir: Directory to save debug visualizations (frame subdir)
-        frame_key: Frame identifier for debug output
-        debug_plots: Whether to generate debug visualizations
-        
-    Returns:
-        Tuple of (cluster_labels, clustering_info_dict)
-    """
-    num_crops = len(crops_data)
-    
-    # Handle edge cases
-    if num_crops == 0:
-        return [], {}
-    
-    if num_crops < k:
-        # Not enough crops for K clusters, assign all to cluster 0
-        labels = [0] * num_crops
-        info = {
-            "k": 1,
-            "inertia": 0.0,
-            "cluster_distribution": {"0": num_crops}
-        }
-        return labels, info
-    
-    # Extract feature matrix
-    feature_matrix = np.array([crop["hsv_hist"] for crop in crops_data])
-    
-    # Normalize features
-    scaler = StandardScaler()
-    feature_matrix_scaled = scaler.fit_transform(feature_matrix)
-    
-    # Run K-Means with K=2
-    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-    kmeans.fit(feature_matrix_scaled)
-    
-    cluster_labels = kmeans.labels_.tolist()
-    
-    # Build clustering info
-    cluster_distribution = {}
-    for label in cluster_labels:
-        cluster_distribution[str(label)] = cluster_distribution.get(str(label), 0) + 1
-    
-    clustering_info = {
-        "k": k,
-        "inertia": float(kmeans.inertia_),
-        "cluster_distribution": cluster_distribution,
+) -> tuple[list[int], dict[str, int | float | dict[str, int]]]:
+    """Backward compatible helper that delegates to :class:`TeamClusterer`."""
+
+    clusterer = TeamClusterer(n_clusters=k)
+    result = clusterer.cluster(
+        crops_data,
+        output_dir=output_dir,
+        frame_key=frame_key,
+        debug_plots=debug_plots,
+    )
+    info: dict[str, int | float | dict[str, int]] = {
+        "k": result.summary.k,
+        "inertia": result.summary.inertia,
+        "cluster_distribution": result.summary.cluster_distribution,
     }
-    
-    # Generate debug plots if requested
-    if debug_plots and output_dir and frame_key:
-        frame_dir = output_dir / frame_key
-        frame_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save PCA visualization
-        _visualize_clusters(
-            feature_matrix_scaled,
-            np.array(cluster_labels),
-            k,
-            frame_dir,
-        )
-    
-    return cluster_labels, clustering_info
+    return result.labels, info
 
 
 def _visualize_clusters(
-    feature_matrix: np.ndarray,
-    cluster_labels: np.ndarray,
-    k: int,
     output_dir: Path,
+    feature_matrix: np.ndarray,
+    cluster_labels: Sequence[int],
+    n_clusters: int,
 ) -> None:
-    """Generate PCA visualization of clusters.
-    
-    Args:
-        feature_matrix: Scaled feature matrix (num_crops, num_features)
-        cluster_labels: Cluster assignments for each crop
-        k: Number of clusters
-        output_dir: Frame directory to save visualizations
-    """
-    # PCA projection (2D)
+    """Project clusters via PCA and persist the image for debugging purposes."""
+
+    fig, ax = plt.subplots(figsize=(10, 8))
     pca = PCA(n_components=2, random_state=42)
     coords_pca = pca.fit_transform(feature_matrix)
-    
-    # Create discrete colormap with exactly K colors (colorblind-friendly)
-    colors = plt.cm.tab10.colors[:k]
+    colors = plt.cm.tab10.colors[:n_clusters]
     cmap_discrete = matplotlib.colors.ListedColormap(colors)
-    
-    fig, ax = plt.subplots(figsize=(10, 8))
+
     scatter = ax.scatter(
         coords_pca[:, 0],
         coords_pca[:, 1],
@@ -120,36 +133,34 @@ def _visualize_clusters(
         cmap=cmap_discrete,
         s=100,
         alpha=0.7,
-        edgecolors='black',
+        edgecolors="black",
         linewidth=0.5,
         vmin=-0.5,
-        vmax=k - 0.5
+        vmax=n_clusters - 0.5,
     )
-    
-    # Annotate each point with its crop number (1-indexed)
-    for i, (x, y) in enumerate(coords_pca):
+
+    for idx, (x_coord, y_coord) in enumerate(coords_pca):
         ax.annotate(
-            str(i + 1),  # Crop number (1-indexed)
-            (x, y),
-            xytext=(5, 5),  # Offset from point
-            textcoords='offset points',
+            str(idx + 1),
+            (x_coord, y_coord),
+            xytext=(5, 5),
+            textcoords="offset points",
             fontsize=8,
-            fontweight='bold',
-            color='black',
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='none', alpha=0.15)
+            fontweight="bold",
+            color="black",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="none", alpha=0.15),
         )
-    
-    ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)', fontsize=11)
-    ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)', fontsize=11)
-    ax.set_title(f'PCA Projection (K={k} clusters)', fontsize=13, fontweight='bold')
+
+    ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)", fontsize=11)
+    ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)", fontsize=11)
+    ax.set_title(f"PCA Projection (K={n_clusters} clusters)", fontsize=13, fontweight="bold")
     ax.grid(alpha=0.3)
-    
-    # Add discrete colorbar with exactly K colors
-    cbar = plt.colorbar(scatter, ax=ax, ticks=range(k), boundaries=np.arange(-0.5, k, 1))
-    cbar.set_label('Cluster ID', fontsize=11)
-    cbar.ax.set_yticklabels([str(i) for i in range(k)])
-    
+
+    cbar = plt.colorbar(scatter, ax=ax, ticks=range(n_clusters), boundaries=np.arange(-0.5, n_clusters, 1))
+    cbar.set_label("Cluster ID", fontsize=11)
+    cbar.ax.set_yticklabels([str(i) for i in range(n_clusters)])
+
     plt.tight_layout()
     pca_path = output_dir / "clusters_pca.png"
-    plt.savefig(str(pca_path), dpi=150, bbox_inches='tight')
+    plt.savefig(str(pca_path), dpi=150, bbox_inches="tight")
     plt.close(fig)

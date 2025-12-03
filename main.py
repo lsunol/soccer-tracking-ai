@@ -1,74 +1,127 @@
+"""Command line interface for executing the soccer tracking pipeline."""
+
+from __future__ import annotations
+
+import argparse
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Sequence
 
 import torch
 
-import os
-import sys
+ROOT_DIR = Path(__file__).resolve().parent
+SRC_DIR = ROOT_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
-CURRENT_DIR = os.path.dirname(__file__)
-SRC_DIR = os.path.join(CURRENT_DIR, "src")
-
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
-
-from ai_tracking import run_yolo_on_video, run_yolo_tracking_mode
+from ai_tracking import RunnerConfig, YoloVideoRunner  # noqa: E402
 
 
-def main():
-    # Auto-detect GPU
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    
-    # Create timestamped output directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"./data/output/{timestamp}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Output directory: {output_dir}")
-    
-    # Define paths
-    input_video = r"./data/input/raw-video.mp4"
-    tracked_output = output_dir / "tracked-video.mp4"
-    
-    # Option 1: Frame-by-frame inference with annotations
-    start_time = time.time()
-    frame_count = 0
-    
-    for idx, result in enumerate(run_yolo_on_video(
-        input_path=input_video,
-        output_dir=str(output_dir),
-        # frames=[10],
-        # frames=[216],
-        frames=list(range(0, 10)),
-        debug=True,
-        # debug=False,
+def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments for the tracking application."""
+    parser = argparse.ArgumentParser(description="Run YOLO-based soccer tracking")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=Path("./data/input/raw-video.mp4"),
+        help="Path to the input video",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Directory to store artifacts (defaults to timestamped folder)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="yolov8n.pt",
+        help="Ultralytics model weights to load",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device for inference (auto-detect when omitted)",
+    )
+    parser.add_argument(
+        "--frames",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Optional list of frame indices to process",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug exports (crops, histograms, YOLO video)",
+    )
+    parser.add_argument(
+        "--hsv-strategy",
+        choices=["crop_torso", "mask_green"],
+        default="crop_torso",
+        help="Histogram strategy to isolate jerseys",
+    )
+    parser.add_argument(
+        "--torso-height-ratio",
+        type=float,
+        default=0.4,
+        help="Fraction of crop height used to focus on torsos",
+    )
+    parser.add_argument(
+        "--torso-width-ratio",
+        type=float,
+        default=0.6,
+        help="Fraction of crop width used to focus on torsos",
+    )
+    return parser.parse_args(argv)
+
+
+def build_output_dir(root: Path | None) -> Path:
+    """Return an output directory, creating a timestamped folder when needed."""
+    if root is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        root = Path("./data/output") / timestamp
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_arguments(argv)
+    device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+    output_dir = build_output_dir(args.output)
+
+    config = RunnerConfig(
+        model_source=args.model,
         device=device,
-        hsv_strategy="mask_green",
-    )):
-        frame_count = idx + 1
-        num_detections = len(result.boxes) if result.boxes else 0
-        if idx % 30 == 0:  # Progress update every ~1 second
-            print(f"Frame {idx}: {num_detections} person(s) detected")
-    
-    elapsed_ms = (time.time() - start_time) * 1000
-    fps = frame_count / (elapsed_ms / 1000) if elapsed_ms > 0 else 0
-    
-    print(f"\n{'='*60}")
-    print(f"Processing complete!")
-    print(f"Frames processed: {frame_count}")
-    print(f"Time elapsed: {elapsed_ms:.2f} ms ({elapsed_ms/1000:.2f} seconds)")
-    print(f"Processing speed: {fps:.2f} FPS")
-    print(f"Output saved to {output_dir}")
-    print(f"{'='*60}")
-    
-    # Option 2: Tracking mode with persistent IDs
-    # run_yolo_tracking_mode(
-    #     input_path=input_video,
-    #     output_path=str(tracked_output),
-    #     device=device
-    # )
-    # print(f"Tracking complete! Video saved to {tracked_output}")
+        debug=args.debug,
+        output_dir=output_dir,
+        torso_height_ratio=args.torso_height_ratio,
+        torso_width_ratio=args.torso_width_ratio,
+        hsv_strategy=args.hsv_strategy,
+    )
+
+    runner = YoloVideoRunner(config=config)
+    start_time = time.perf_counter()
+    frames_processed = 0
+
+    for frames_processed, result in enumerate(runner.run(args.input, frames=args.frames), start=1):
+        if frames_processed % 30 == 0:
+            detections = len(result.boxes) if result.boxes is not None else 0
+            print(f"Frame {frames_processed}: {detections} detections")
+
+    elapsed = time.perf_counter() - start_time
+    fps = frames_processed / elapsed if elapsed > 0 else 0.0
+
+    print("\n" + "=" * 60)
+    print("Processing complete")
+    print(f"Frames processed: {frames_processed}")
+    print(f"Wall time: {elapsed:.2f}s | Throughput: {fps:.2f} FPS")
+    print(f"Artifacts saved to: {output_dir}")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
     main()
